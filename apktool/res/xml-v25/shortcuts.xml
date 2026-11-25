@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:icon="@drawable/ic_shortcut_search" android:shortcutId="search" android:shortcutShortLabel="@string/search" android:shortcutLongLabel="@string/search">
+        <intent android:action="com.example.piliplus.SHORTCUT" android:data="bilibili://search" />
+    </shortcut>
+    <shortcut android:icon="@drawable/ic_shortcut_download" android:shortcutId="offline_video" android:shortcutShortLabel="@string/offline_video" android:shortcutLongLabel="@string/offline_video">
+        <intent android:action="com.example.piliplus.SHORTCUT" android:data="bilibili://download" />
+    </shortcut>
+</shortcuts>

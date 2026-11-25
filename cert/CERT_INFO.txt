@@ -1,0 +1,11 @@
+Keystore file  : debug.keystore
+PEM cert file  : signing_cert.pem
+Alias          : androiddebugkey
+Store password : android
+Key password   : android
+Owner / Issuer : CN=Android Debug, O=Android, C=US
+Serial         : ee8dd3d98fab2e4a
+Valid          : Tue Nov 03 20:53:49 CST 2026 -> Sat Mar 21 20:53:49 CST 2054
+Signature Alg  : SHA384withRSA (2048-bit RSA)
+SHA-1          : 93:2D:80:82:C8:84:5C:8A:EF:21:FE:F2:0D:E1:8D:59:12:44:35:28
+SHA-256        : 27:84:95:BE:52:3D:36:C9:29:19:0E:D7:5E:67:84:2F:28:E6:E8:F6:50:3C:76:F9:95:FC:9F:E5:66:BA:73:3D
