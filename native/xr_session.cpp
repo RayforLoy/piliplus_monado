@@ -226,7 +226,6 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 	const char *required[] = {
 		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 		XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
-		XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME,
 		XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
 	};
 	for(const char *name : required)
@@ -239,6 +238,9 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 		}
 		extensions.push_back(name);
 	}
+	android_surface_supported_ = has_ext(XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME);
+	if(android_surface_supported_)
+		extensions.push_back(XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME);
 	// Opcional: sem passthrough o app cai para ambiente escuro.
 	if(has_ext(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
@@ -257,7 +259,7 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 	// XrSwapchainCreateInfo ao chamar xrCreateSwapchainAndroidSurfaceKHR. Sem
 	// ela o swapchain e criado, o MediaCodec decodifica normalmente, e o
 	// runtime morre ao compor a camada.
-	if(has_ext(XR_FB_ANDROID_SURFACE_SWAPCHAIN_CREATE_EXTENSION_NAME))
+	if(android_surface_supported_ && has_ext(XR_FB_ANDROID_SURFACE_SWAPCHAIN_CREATE_EXTENSION_NAME))
 	{
 		surface_swapchain_create_supported_ = true;
 		extensions.push_back(XR_FB_ANDROID_SURFACE_SWAPCHAIN_CREATE_EXTENSION_NAME);
@@ -658,11 +660,11 @@ bool XrVideoSession::LoadExtensionFunctions()
 		return XR_SUCCEEDED(res);
 	};
 
-	if(!get("xrCreateSwapchainAndroidSurfaceKHR",
+	if(android_surface_supported_ && !get("xrCreateSwapchainAndroidSurfaceKHR",
 			(PFN_xrVoidFunction *)&pfnCreateSwapchainAndroidSurfaceKHR))
 	{
-		LOGE("xrCreateSwapchainAndroidSurfaceKHR unavailable");
-		return false;
+		LOGW("Direct surface path unavailable");
+		pfnCreateSwapchainAndroidSurfaceKHR = nullptr;
 	}
 
 	if(color_space_supported_ && !get("xrSetColorSpaceFB", (PFN_xrVoidFunction *)&pfnSetColorSpaceFB))
@@ -3758,6 +3760,12 @@ jobject XrVideoSession::CreateVideoSurface(JNIEnv *env, int32_t width, int32_t h
 		pending_gl_width_ = width;
 		pending_gl_height_ = height;
 		params_.aspectRatio = (float)width / (float)height;
+		return nullptr;
+	}
+
+	if(!pfnCreateSwapchainAndroidSurfaceKHR)
+	{
+		last_error_ = "Direct rendering requires XR_KHR_android_surface_swapchain";
 		return nullptr;
 	}
 

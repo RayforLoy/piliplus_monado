@@ -692,6 +692,7 @@ private:
 	std::atomic<int> recommended_height_{0};
 	bool logged_recommended_resolution_ = false;
 
+	bool android_surface_supported_ = false;
 	PFN_xrCreateSwapchainAndroidSurfaceKHR pfnCreateSwapchainAndroidSurfaceKHR = nullptr;
 	PFN_xrSetAndroidApplicationThreadKHR pfnSetAndroidApplicationThreadKHR = nullptr;
 	PFN_xrGetRecommendedLayerResolutionMETA pfnGetRecommendedLayerResolutionMETA = nullptr;
