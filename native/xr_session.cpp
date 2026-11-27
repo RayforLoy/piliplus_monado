@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -278,7 +279,7 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 		extensions.push_back(XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME);
 	}
 	else
-		LOGW("XR_FB_composition_layer_image_layout unavailable; the image will be mirrored");
+		LOGI("Using GLES row order for Android Canvas layers");
 
 	if(has_ext(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME))
 	{
@@ -460,6 +461,9 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 		LOGI("Extension enabled: %s", name);
 
 	XR_CHECK(XR_NULL_HANDLE, xrCreateInstance(&instance_info, &instance_), "xrCreateInstance");
+	XrInstanceProperties runtime{XR_TYPE_INSTANCE_PROPERTIES};
+	if(XR_SUCCEEDED(xrGetInstanceProperties(instance_, &runtime)))
+		monado_runtime_ = std::strstr(runtime.runtimeName, "Monado") != nullptr;
 
 	XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
 	system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -539,6 +543,9 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 	space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
 	XR_CHECK(instance_, xrCreateReferenceSpace(session_, &space_info, &view_space_),
 			"xrCreateReferenceSpace(VIEW)");
+
+	if(monado_runtime_ && !InitControllerActions())
+		LOGW("Could not attach Khronos Simple Controller actions");
 
 	// O app nao renderiza geometria, entao em tese nao precisa saber nada sobre
 	// as views. Mas todo app OpenXR faz este handshake, e um runtime pode muito
@@ -1102,6 +1109,31 @@ bool XrVideoSession::InitCornerSwapchain()
 	return CreateQuadSwapchain(64, 64, &corner_swapchain_, &corner_images_, "CornerHandle");
 }
 
+// Canvas row zero is the visual top. GLES row zero is the visual bottom
+// unless the runtime applies XR_FB_composition_layer_image_layout.
+static void CopyCanvasRows(uint8_t *dst, const uint8_t *src, size_t row_bytes,
+                           size_t source_stride, int32_t rows, bool reverse)
+{
+	if(!reverse && row_bytes == source_stride)
+	{
+		std::memcpy(dst, src, row_bytes * rows);
+		return;
+	}
+	for(int32_t y = 0; y < rows; ++y)
+	{
+		const int32_t src_row = reverse ? rows - 1 - y : y;
+		std::memcpy(dst + row_bytes * y, src + source_stride * src_row, row_bytes);
+	}
+}
+
+static void CopyCanvasBitmap(std::vector<uint8_t> &dst, const uint8_t *src,
+                             int32_t width, int32_t height, bool reverse)
+{
+	const size_t stride = (size_t)width * 4;
+	dst.resize(stride * height);
+	CopyCanvasRows(dst.data(), src, stride, stride, height, reverse);
+}
+
 void XrVideoSession::SetSettingsBitmap(const uint8_t *pixels, int32_t width, int32_t height)
 {
 	if(!pixels || width <= 0 || height <= 0)
@@ -1110,7 +1142,7 @@ void XrVideoSession::SetSettingsBitmap(const uint8_t *pixels, int32_t width, int
 		std::lock_guard<std::mutex> lock(settings_mutex_);
 		settings_width_ = width;
 		settings_height_ = height;
-		settings_pixels_.assign(pixels, pixels + (size_t)width * height * 4);
+		CopyCanvasBitmap(settings_pixels_, pixels, width, height, !image_layout_supported_);
 	}
 	settings_dirty_count_.store((int)std::max((size_t)3, settings_images_.size()));
 }
@@ -1192,7 +1224,7 @@ void XrVideoSession::SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t 
 		std::lock_guard<std::mutex> lock(hud_mutex_);
 		hud_width_ = width;
 		hud_height_ = height;
-		hud_pixels_.assign(pixels, pixels + (size_t)width * height * 4);
+		CopyCanvasBitmap(hud_pixels_, pixels, width, height, !image_layout_supported_);
 	}
 	hud_dirty_count_.store((int)std::max((size_t)3, hud_images_.size()));
 }
@@ -1291,7 +1323,7 @@ void XrVideoSession::SetOsdBitmap(const uint8_t *pixels, int32_t width, int32_t 
 		std::lock_guard<std::mutex> lock(osd_mutex_);
 		osd_width_ = width;
 		osd_height_ = height;
-		osd_pixels_.assign(pixels, pixels + (size_t)width * height * 4);
+		CopyCanvasBitmap(osd_pixels_, pixels, width, height, !image_layout_supported_);
 	}
 	osd_dirty_count_.store((int)std::max((size_t)3, osd_images_.size()));
 }
@@ -1386,7 +1418,7 @@ void XrVideoSession::SetResBitmap(const uint8_t *pixels, int32_t width, int32_t 
 		std::lock_guard<std::mutex> lock(res_mutex_);
 		res_width_ = width;
 		res_height_ = height;
-		res_pixels_.assign(pixels, pixels + (size_t)width * height * 4);
+		CopyCanvasBitmap(res_pixels_, pixels, width, height, !image_layout_supported_);
 	}
 	res_dirty_count_.store((int)std::max((size_t)3, res_images_.size()));
 }
@@ -1486,11 +1518,13 @@ struct DanmakuSlot
 	int32_t h = 0;
 	int32_t copy_h = 0;
 	uint64_t tag_seq = 0;
+	bool stereo = false;
 	bool valid = false;
 };
 static DanmakuSlot g_dm_slots[2];
 static std::atomic<uint64_t> g_dm_wake_seq{0};
 static std::atomic<int32_t> g_dm_upload_h_hint{0};
+static std::atomic<bool> g_danmaku_is_stereo{false};
 namespace {
 std::atomic<uint64_t> g_xr_frame_seq{0};
 } // namespace
@@ -1499,16 +1533,31 @@ void SetDanmakuUploadHeightHint(int32_t height)
 	g_dm_upload_h_hint.store(height, std::memory_order_release);
 }
 
-void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height)
+void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height,
+                                     size_t source_stride)
 {
 	if(!pixels || width <= 0 || height <= 0)
 		return;
+	const size_t row_bytes = (size_t)width * 4;
+	if(source_stride < row_bytes)
+		return;
 	const int32_t hint_h = g_dm_upload_h_hint.load(std::memory_order_acquire);
-	const int32_t copy_h = (hint_h > 0 && hint_h < height) ? hint_h : height;
-	const size_t byteCount = (size_t)width * copy_h * 4;
+	const bool stereo = g_danmaku_is_stereo.load() && danmaku_swapchain_right_ != XR_NULL_HANDLE;
+	const int32_t copy_h = (!stereo && hint_h > 0 && hint_h < height) ? hint_h : height;
 	const uint64_t wake_seq = g_dm_wake_seq.load(std::memory_order_acquire);
 	std::lock_guard<std::mutex> writeLock(danmaku_write_mutex_);
-	danmaku_staging_pixels_.assign(pixels, pixels + byteCount);
+	danmaku_staging_pixels_.resize(row_bytes * copy_h);
+	uint8_t *dst = danmaku_staging_pixels_.data();
+	if(stereo && !image_layout_supported_)
+	{
+		// Reverse each eye inside the stacked bitmap, preserving left/right order.
+		const int32_t eye_h = height / 2;
+		CopyCanvasRows(dst, pixels, row_bytes, source_stride, eye_h, true);
+		CopyCanvasRows(dst + row_bytes * eye_h, pixels + source_stride * eye_h,
+		               row_bytes, source_stride, eye_h, true);
+	}
+	else
+		CopyCanvasRows(dst, pixels, row_bytes, source_stride, copy_h, !image_layout_supported_);
 	{
 		std::lock_guard<std::mutex> lock(danmaku_mutex_);
 		int target = -1;
@@ -1528,6 +1577,7 @@ void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int3
 		g_dm_slots[target].w = width;
 		g_dm_slots[target].h = height;
 		g_dm_slots[target].copy_h = copy_h;
+		g_dm_slots[target].stereo = stereo;
 		g_dm_slots[target].tag_seq = wake_seq;
 		g_dm_slots[target].valid = true;
 	}
@@ -1536,7 +1586,6 @@ void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int3
 static std::atomic<float> g_danmaku_depth_factor{0.99f};
 static std::atomic<float> g_danmaku_span_x{1.0f};
 static std::atomic<float> g_danmaku_span_y{1.0f};
-static std::atomic<bool> g_danmaku_is_stereo{false};
 static std::atomic<float> g_screen_pitch_offset{0.0f};
 static std::atomic<float> g_screen_yaw_offset{0.0f};
 
@@ -1735,7 +1784,8 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 		}
 		if(best >= 0)
 		{
-			if(!g_dm_slots[best].pixels.empty() && g_dm_slots[best].w > 0 && g_dm_slots[best].h > 0
+			if(g_dm_slots[best].stereo == is_stereo
+					&& !g_dm_slots[best].pixels.empty() && g_dm_slots[best].w > 0 && g_dm_slots[best].h > 0
 					&& g_dm_slots[best].w <= kDanmakuWidth && g_dm_slots[best].h <= kDanmakuHeight)
 			{
 				danmaku_upload_pixels_.swap(g_dm_slots[best].pixels);
@@ -1830,7 +1880,8 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 					const int32_t partial_h = std::min(up_copy_h, active_h);
-					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, active_w, partial_h,
+					const int32_t upload_y = image_layout_supported_ ? 0 : active_h - partial_h;
+					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, upload_y, active_w, partial_h,
 							GL_RGBA, GL_UNSIGNED_BYTE, danmaku_upload_pixels_.data());
 					glBindTexture(GL_TEXTURE_2D, 0);
 				}
@@ -2015,7 +2066,7 @@ bool XrVideoSession::UpdateCursorLayer(XrCompositionLayerQuad &layer, int slot)
 	if(hand_cursor_active_.load() && hand_cursor_hidden_.load())
 		return false;
 
-	if(!hud_visible_.load() && !settings_visible_.load())
+	if(!browser_mode_ && !hud_visible_.load() && !settings_visible_.load())
 		return false;
 
 	layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -2032,6 +2083,161 @@ bool XrVideoSession::UpdateCursorLayer(XrCompositionLayerQuad &layer, int slot)
 	layer.pose.position = cursor_pos_[slot];
 	layer.pose.orientation = cursor_ori_[slot];
 	return true;
+}
+
+bool XrVideoSession::InitControllerActions()
+{
+	XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
+	std::strcpy(set_info.actionSetName, "pili_controls");
+	std::strcpy(set_info.localizedActionSetName, "PiliPlus controls");
+	if(XR_FAILED(xrCreateActionSet(instance_, &set_info, &controller_actions_)))
+		return false;
+	if(XR_FAILED(xrStringToPath(instance_, "/user/hand/right", &controller_hand_)))
+		return false;
+
+	auto create_action = [&](XrActionType type, const char *name, const char *label, XrAction *action) {
+		XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+		info.actionType = type;
+		std::strcpy(info.actionName, name);
+		std::strcpy(info.localizedActionName, label);
+		info.countSubactionPaths = 1;
+		info.subactionPaths = &controller_hand_;
+		return XR_SUCCEEDED(xrCreateAction(controller_actions_, &info, action));
+	};
+	if(!create_action(XR_ACTION_TYPE_POSE_INPUT, "aim", "Aim", &controller_aim_)
+			|| !create_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "select", "Select", &controller_select_)
+			|| !create_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Back", &controller_menu_))
+		return false;
+
+	std::array<XrActionSuggestedBinding, 3> bindings{{
+		{controller_aim_, XR_NULL_PATH},
+		{controller_select_, XR_NULL_PATH},
+		{controller_menu_, XR_NULL_PATH},
+	}};
+	const char *paths[] = {
+		"/user/hand/right/input/aim/pose",
+		"/user/hand/right/input/select/click",
+		"/user/hand/right/input/menu/click",
+	};
+	for(size_t i = 0; i < bindings.size(); ++i)
+		if(XR_FAILED(xrStringToPath(instance_, paths[i], &bindings[i].binding)))
+			return false;
+
+	XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+	if(XR_FAILED(xrStringToPath(instance_, "/interaction_profiles/khr/simple_controller",
+	                          &suggested.interactionProfile)))
+		return false;
+	suggested.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
+	suggested.suggestedBindings = bindings.data();
+	if(XR_FAILED(xrSuggestInteractionProfileBindings(instance_, &suggested)))
+		return false;
+
+	XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+	space_info.action = controller_aim_;
+	space_info.subactionPath = controller_hand_;
+	space_info.poseInActionSpace.orientation.w = 1.0f;
+	if(XR_FAILED(xrCreateActionSpace(session_, &space_info, &controller_space_)))
+		return false;
+
+	XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+	attach.countActionSets = 1;
+	attach.actionSets = &controller_actions_;
+	controller_attached_ = XR_SUCCEEDED(xrAttachSessionActionSets(session_, &attach));
+	return controller_attached_;
+}
+
+void XrVideoSession::DestroyControllerActions()
+{
+	if(controller_actions_ != XR_NULL_HANDLE)
+		xrDestroyActionSet(controller_actions_);
+	controller_actions_ = XR_NULL_HANDLE;
+	controller_attached_ = false;
+}
+
+void XrVideoSession::UpdateController(XrTime display_time)
+{
+	if(!controller_attached_)
+		return;
+
+	constexpr int tracked_bit = 8;
+	constexpr int select_bit = 16;
+	constexpr int menu_bit = 32;
+	XrActiveActionSet active{controller_actions_, controller_hand_};
+	XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+	sync.countActiveActionSets = 1;
+	sync.activeActionSets = &active;
+
+	ControllerSample sample;
+	bool select_active = false;
+	bool select_down = false;
+	bool menu_active = false;
+	bool menu_down = false;
+	if(session_state_ == XR_SESSION_STATE_FOCUSED && xrSyncActions(session_, &sync) == XR_SUCCESS)
+	{
+		XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+		get.action = controller_select_;
+		get.subactionPath = controller_hand_;
+		XrActionStateBoolean select{XR_TYPE_ACTION_STATE_BOOLEAN};
+		select_active = XR_SUCCEEDED(xrGetActionStateBoolean(session_, &get, &select)) && select.isActive;
+		select_down = select_active && select.currentState;
+		get.action = controller_menu_;
+		XrActionStateBoolean menu{XR_TYPE_ACTION_STATE_BOOLEAN};
+		menu_active = XR_SUCCEEDED(xrGetActionStateBoolean(session_, &get, &menu)) && menu.isActive;
+		menu_down = menu_active && menu.currentState;
+
+		get.action = controller_aim_;
+		XrActionStatePose aim{XR_TYPE_ACTION_STATE_POSE};
+		XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+		constexpr XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+				| XR_SPACE_LOCATION_POSITION_VALID_BIT;
+		if(XR_SUCCEEDED(xrGetActionStatePose(session_, &get, &aim)) && aim.isActive
+				&& XR_SUCCEEDED(xrLocateSpace(controller_space_, app_space_, display_time, &location))
+				&& (location.locationFlags & valid) == valid)
+		{
+			const XrVector3f &p = location.pose.position;
+			const XrVector3f d = RotateVector(location.pose.orientation, {0.0f, 0.0f, -1.0f});
+			sample.flags = tracked_bit | UpdateControllerRay(p.x, p.y, p.z, d.x, d.y, d.z,
+					select_down, &sample.u, &sample.v);
+		}
+	}
+	if(!(sample.flags & tracked_bit))
+	{
+		cursor_visible_[0].store(false);
+		corner_hovered_.store(false);
+	}
+	// Require a release after gaining focus or regaining tracking.
+	controller_armed_ = (sample.flags & tracked_bit) && select_active && (controller_armed_ || !select_down);
+	menu_armed_ = menu_active && (menu_armed_ || !menu_down);
+	if(controller_armed_ && select_down)
+		sample.flags |= select_bit;
+	if(menu_armed_ && menu_down)
+		sample.flags |= menu_bit;
+
+	std::lock_guard<std::mutex> lock(controller_mutex_);
+	constexpr int transitions = tracked_bit | select_bit | menu_bit;
+	if((sample.flags ^ controller_latest_.flags) & transitions)
+	{
+		if(controller_changes_.size() >= 32)
+		{
+			controller_changes_.clear();
+			controller_changes_.push_back({});
+			controller_armed_ = false;
+			menu_armed_ = false;
+			sample.flags &= ~(select_bit | menu_bit);
+		}
+		controller_changes_.push_back(sample);
+	}
+	controller_latest_ = sample;
+}
+
+ControllerSample XrVideoSession::ReadController()
+{
+	std::lock_guard<std::mutex> lock(controller_mutex_);
+	if(controller_changes_.empty())
+		return controller_latest_;
+	ControllerSample sample = controller_changes_.front();
+	controller_changes_.pop_front();
+	return sample;
 }
 
 int XrVideoSession::UpdateControllerRay(float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV)
@@ -2179,7 +2385,8 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 								for(int dx_px = -18; dx_px <= 18; dx_px += 9)
 								{
 									int sx = std::clamp(px + dx_px, 0, hud_width_ - 1);
-									uint8_t alpha = hud_pixels_[((size_t)sy * hud_width_ + sx) * 4 + 3];
+									const int row = image_layout_supported_ ? sy : hud_height_ - 1 - sy;
+									uint8_t alpha = hud_pixels_[((size_t)row * hud_width_ + sx) * 4 + 3];
 									if(alpha > 15)
 									{
 										hit_opaque = true;
@@ -2314,7 +2521,7 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 						cursor_size_[slot] = 0.024f * (cdist / 1.5f);
 					}
 					cursor_visible_[slot].store(!(hand_cursor_active_.load() && hand_cursor_hidden_.load()));
-					if(hud_visible_.load() && projection_mode_.load() == 0 && u >= 0.84f && u <= 1.12f && v >= 0.80f && v <= 1.12f)
+					if(!browser_mode_ && hud_visible_.load() && projection_mode_.load() == 0 && u >= 0.84f && u <= 1.12f && v >= 0.80f && v <= 1.12f)
 					{
 						corner_hovered_.store(true);
 						if(outU) *outU = std::clamp(u, 0.0f, 1.0f);
@@ -4239,7 +4446,7 @@ void XrVideoSession::StartFrameLoop()
 
 void XrVideoSession::StopFrameLoop()
 {
-	if(!running_.exchange(false))
+	if(!running_.exchange(false) && !frame_thread_.joinable())
 		return;
 	{
 		std::lock_guard<std::mutex> lk(g_xr_frame_mtx);
@@ -4263,6 +4470,9 @@ void XrVideoSession::StopFrameLoop()
 	// que o Android reclama.
 	if(session_running_ && !exit_requested_)
 	{
+		// Browser and playback hand off the runtime while the app stays foreground.
+		// Request STOPPING explicitly instead of relying on an Android focus change.
+		xrRequestExitSession(session_);
 		const auto limite = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
 		while(session_running_ && !exit_requested_
 				&& std::chrono::steady_clock::now() < limite)
@@ -4557,7 +4767,7 @@ void XrVideoSession::RenderFrame()
 		}
 	}
 
-	if(hand_tracking_supported_ && frame_state.shouldRender)
+	if(!browser_mode_ && hand_tracking_supported_ && frame_state.shouldRender)
 	{
 		UpdateHandTracking(frame_state.predictedDisplayTime);
 	}
@@ -4687,6 +4897,8 @@ void XrVideoSession::RenderFrame()
 			}
 		}
 	}
+
+	UpdateController(frame_state.predictedDisplayTime);
 
 	std::vector<const XrCompositionLayerBaseHeader *> layers;
 
@@ -5571,6 +5783,10 @@ void XrVideoSession::Destroy()
 		}
 	}
 
+	if(controller_space_ != XR_NULL_HANDLE)
+		xrDestroySpace(controller_space_);
+	controller_space_ = XR_NULL_HANDLE;
+
 	if(app_space_ != XR_NULL_HANDLE)
 		xrDestroySpace(app_space_);
 	if(view_space_ != XR_NULL_HANDLE)
@@ -5581,6 +5797,7 @@ void XrVideoSession::Destroy()
 	if(session_ != XR_NULL_HANDLE)
 		xrDestroySession(session_);
 	session_ = XR_NULL_HANDLE;
+	DestroyControllerActions();
 
 	DestroyEgl();
 

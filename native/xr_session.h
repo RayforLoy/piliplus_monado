@@ -15,6 +15,7 @@
 #include "tone_mapper.h"
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <thread>
 #include <mutex>
 #include <string>
@@ -205,6 +206,14 @@ enum class RenderPath
 	ToneMapped = 1,
 };
 
+// Lower three bits identify the panel hit (screen 1, HUD 2, settings 3).
+struct ControllerSample
+{
+	int flags = 0;
+	float u = 0;
+	float v = 0;
+};
+
 class XrVideoSession
 {
 public:
@@ -271,6 +280,9 @@ public:
 		*width = recommended_width_.load();
 		*height = recommended_height_.load();
 	}
+	bool SetBrowserMode() { return browser_mode_ = controller_attached_; }
+	bool UsesSimpleController() const { return monado_runtime_; }
+	ControllerSample ReadController();
 	void SetLayerShape(LayerShape shape) { layer_shape_ = shape; }
 
 	/**
@@ -429,7 +441,7 @@ public:
 	void SetOsdVisible(bool visible) { osd_visible_ = visible; }
 	void SetResBitmap(const uint8_t *pixels, int32_t width, int32_t height);
 	void SetResVisible(bool visible) { res_visible_ = visible; }
-	void SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height);
+	void SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height, size_t source_stride);
 	void SetDanmakuVisible(bool visible) { danmaku_visible_ = visible; }
 	int UpdateControllerRay(float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV);
 	int UpdatePointerRay(int slot, float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV, bool is_controller = true);
@@ -463,6 +475,24 @@ public:
 	const char *LastError() const { return last_error_.c_str(); }
 
 private:
+	bool InitControllerActions();
+	void UpdateController(XrTime display_time);
+	void DestroyControllerActions();
+
+	XrActionSet controller_actions_ = XR_NULL_HANDLE;
+	XrAction controller_aim_ = XR_NULL_HANDLE;
+	XrAction controller_select_ = XR_NULL_HANDLE;
+	XrAction controller_menu_ = XR_NULL_HANDLE;
+	XrSpace controller_space_ = XR_NULL_HANDLE;
+	XrPath controller_hand_ = XR_NULL_PATH;
+	bool controller_attached_ = false;
+	bool controller_armed_ = false;
+	bool menu_armed_ = false;
+	bool browser_mode_ = false;
+	bool monado_runtime_ = false;
+	std::mutex controller_mutex_;
+	ControllerSample controller_latest_;
+	std::deque<ControllerSample> controller_changes_;
 	bool InitEgl();
 	void DestroyEgl();
 	bool InitPassthrough();

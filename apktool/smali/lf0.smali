@@ -1810,6 +1810,9 @@
     .line 511
     :cond_13
     invoke-virtual {v0}, Lio/flutter/plugin/editing/b;->d()V
+    invoke-static {v2, v9}, Lcom/example/piliplus/vr/Cv10Browser;->onImeRequest(Landroid/view/View;Z)Z
+    move-result v3
+    if-nez v3, :goto_8
 
     .line 512
     .line 513
@@ -1833,6 +1836,10 @@
     :cond_14
     :goto_7
     invoke-virtual {v2}, Landroid/view/View;->requestFocus()Z
+    const/4 v3, 0x1
+    invoke-static {v2, v3}, Lcom/example/piliplus/vr/Cv10Browser;->onImeRequest(Landroid/view/View;Z)Z
+    move-result v3
+    if-nez v3, :goto_8
 
     .line 523
     .line 524
@@ -1899,6 +1906,9 @@
     .line 554
     .line 555
     invoke-virtual {v0}, Lio/flutter/plugin/editing/b;->d()V
+    invoke-static {v1, v9}, Lcom/example/piliplus/vr/Cv10Browser;->onImeRequest(Landroid/view/View;Z)Z
+    move-result v2
+    if-nez v2, :goto_9
 
     .line 556
     .line 557

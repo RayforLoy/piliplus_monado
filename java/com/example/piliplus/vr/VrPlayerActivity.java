@@ -80,6 +80,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private View blackView;
     private PowerManager.WakeLock wakeLock;
     private boolean touchActive = false;
+    private boolean simpleController;
+    private final Cv10Input cv10Input = new Cv10Input();
     /** Default VR background on entry (true = passthrough, false = pitch black), configurable in HUD settings. */
     private boolean defaultPassthrough = true;
     private boolean passthrough = true;
@@ -261,9 +263,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         hudHideTimeoutMs = 5000L;
         try { overridePendingTransition(0, 0); } catch (Throwable ignored) {}
 
-        // Transparent placeholder window with permanent KEEP_SCREEN_ON
         blackView = new View(this);
-        blackView.setBackgroundColor(Color.TRANSPARENT);
+        blackView.setBackgroundColor(Color.BLACK);
         blackView.setKeepScreenOn(true);
         setContentView(blackView);
 
@@ -514,7 +515,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             alignPanelRate();
             xr.setVideoLayerEnabled(true);
 
-            touchActive = TouchInput.attach(xr.getNativeHandle());
+            simpleController = Cv10Input.usesSimpleController(xr.getNativeHandle());
+            if (!simpleController) touchActive = TouchInput.attach(xr.getNativeHandle());
 
             xr.start();
             xr.recenter();
@@ -581,7 +583,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private void failInit() {
         initializing = false;
         try {
-            Toast.makeText(this, "VR 启动失败，已返回 2D", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "VR 播放启动失败，正在返回头显浏览", Toast.LENGTH_LONG).show();
         } catch (Throwable ignored) {}
         exitVr();
     }
@@ -627,6 +629,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             try { TouchInput.detach(); } catch (Throwable ignored) {}
             touchActive = false;
         }
+        cv10Input.reset();
 
         if (vrWid != 0) {
             try { MpvBridge.deleteGlobalRef(vrWid); } catch (Throwable ignored) {}
@@ -2682,9 +2685,10 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         initializing = false;
         initGen++;
         if (handler != null) handler.removeCallbacks(this);
-        Log.i(TAG, "Exiting VR mode, restoring mpv and returning to 2D");
+        Log.i(TAG, "Closing VR playback and restoring the browser player");
 
         try {
+            if (simpleController) isPaused = true;
             detachMpvFromVrSurface();
         } catch (Throwable t) {
             Log.w(TAG, "detachMpvFromVrSurface failed", t);
@@ -2811,7 +2815,12 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             attachMpvToVrSurface();
         }
 
-        if (!touchActive && xr != null && xr.getNativeHandle() != 0) {
+        if (simpleController && xr != null) {
+            for (int i = 0; i < 4 && xr != null && isRunning; i++) {
+                handleCv10Input();
+            }
+            if (!isRunning) return;
+        } else if (!touchActive && xr != null && xr.getNativeHandle() != 0) {
             long now = SystemClock.uptimeMillis();
             if (now - lastAttachAttemptTime > 1000L) {
                 lastAttachAttemptTime = now;
@@ -3435,5 +3444,30 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private void handleHudClick(float normX, float normY) {
         if (!isHudVisible || hudRenderer == null) return;
         hudRenderer.handleClick(normX, normY, this, settingsOpen, qualityOptions);
+    }
+
+    private void handleCv10Input() {
+        cv10Input.poll(xr);
+        if (cv10Input.menuPressed()) {
+            if (settingsOpen) toggleSettingsPanel();
+            else exitVr();
+            return;
+        }
+        if (!cv10Input.selectPressed() || xr == null || !isRunning || !cv10Input.tracked()) return;
+        final long now = SystemClock.uptimeMillis();
+        lastInteractionAt = lastHudActionTime = now;
+        hudHideTimeoutMs = 7000L;
+        if (!isHudVisible) {
+            isHudVisible = true;
+            xr.setHudVisible(true);
+            updateHud();
+        } else if (cv10Input.hit() == Cv10Input.HUD) {
+            handleHudClick(cv10Input.uv[0], cv10Input.uv[1]);
+        } else if (cv10Input.hit() == Cv10Input.SETTINGS && settingsOpen) {
+            if (hudRenderer.handleSettingsClick(cv10Input.uv[0], cv10Input.uv[1], this, qualityOptions)) {
+                updateSettingsPanel();
+                updateHud();
+            }
+        }
     }
 }

@@ -40,6 +40,35 @@ extern "C" {
 
 #define JNI_FCN(name) Java_io_github_gblandro_p5m_XrBridge_##name
 
+JNIEXPORT jboolean JNICALL Java_com_example_piliplus_vr_Cv10Browser_isRendering(
+		JNIEnv *, jclass, jlong ptr)
+{
+	return ptr && Handle(ptr)->IsSessionRendering();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_example_piliplus_vr_Cv10Input_configureBrowser(
+		JNIEnv *, jclass, jlong ptr)
+{
+	return ptr && Handle(ptr)->SetBrowserMode();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_example_piliplus_vr_Cv10Input_usesSimpleController(
+		JNIEnv *, jclass, jlong ptr)
+{
+	return ptr && Handle(ptr)->UsesSimpleController();
+}
+
+JNIEXPORT jint JNICALL Java_com_example_piliplus_vr_Cv10Input_read(
+		JNIEnv *env, jclass, jlong ptr, jfloatArray uv)
+{
+	if(!ptr || !uv || env->GetArrayLength(uv) < 2)
+		return 0;
+	const auto sample = Handle(ptr)->ReadController();
+	const jfloat coords[] = {sample.u, sample.v};
+	env->SetFloatArrayRegion(uv, 0, 2, coords);
+	return sample.flags;
+}
+
 JNIEXPORT jlong JNICALL JNI_FCN(nativeCreate)(JNIEnv *env, jobject, jobject activity)
 {
 	auto *session = new XrVideoSession();
@@ -447,7 +476,7 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetDanmakuBitmap)(JNIEnv *env, jobject, jlo
 	if(AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
 		return;
 	Handle(ptr)->SetDanmakuBitmap(static_cast<const uint8_t *>(pixels), (int32_t)info.width,
-			(int32_t)info.height);
+			(int32_t)info.height, info.stride);
 	AndroidBitmap_unlockPixels(env, bitmap);
 }
 

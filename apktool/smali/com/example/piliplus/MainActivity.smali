@@ -2,6 +2,7 @@
 .super Lv8;
 .source "r8-map-id-7f787bac0906d61b4bf82674a88826f568af9e0c197b0330482b0a1afffd0a95"
 
+.implements Lcom/example/piliplus/vr/Cv10Browser$SurfaceTarget;
 
 # direct methods
 .method public constructor <init>()V
@@ -142,14 +143,68 @@
 .end method
 
 .method public onResume()V
-    .locals 0
+    .locals 3
 
     invoke-super {p0}, Lv8;->onResume()V
 
     sput-object p0, Lcom/example/piliplus/vr/VrState;->main2DActivity:Landroid/app/Activity;
     invoke-static {p0}, Lcom/example/piliplus/vr/VrModeButton;->install(Landroid/app/Activity;)V
 
+    iget-object v0, p0, Lv8;->h:Lkp;
+    if-eqz v0, :done
+    iget-object v1, v0, Lkp;->c:Lyq;
+    if-eqz v1, :done
+    iget-object v2, v1, Lyq;->h:Lqq;
+    if-eqz v2, :done
+    invoke-static {p0, v1, v2}, Lcom/example/piliplus/vr/Cv10Browser;->resume(Landroid/app/Activity;Landroid/view/View;Landroid/view/SurfaceView;)V
+
+    :done
     return-void
+.end method
+
+.method public onPause()V
+    .locals 0
+
+    invoke-static {p0}, Lcom/example/piliplus/vr/Cv10Browser;->pause(Landroid/app/Activity;)V
+    invoke-super {p0}, Lv8;->onPause()V
+    return-void
+.end method
+
+# Transfer only the Flutter renderer's target. Keep its engine, view, texture
+# registry, lifecycle, viewport and input connection attached to MainActivity.
+.method public routePiliSurface(Landroid/view/Surface;)Z
+    .locals 3
+
+    iget-object v0, p0, Lv8;->h:Lkp;
+    if-eqz v0, :unavailable
+    iget-object v0, v0, Lkp;->c:Lyq;
+    if-eqz v0, :unavailable
+    iget-object v1, v0, Lyq;->h:Lqq;
+    if-eqz v1, :unavailable
+    invoke-virtual {v1}, Lqq;->getAttachedRenderer()Lio/flutter/embedding/engine/renderer/e;
+    move-result-object v2
+    if-eqz v2, :unavailable
+
+    if-nez p1, :check_surface
+    invoke-virtual {v1}, Landroid/view/SurfaceView;->getHolder()Landroid/view/SurfaceHolder;
+    move-result-object v0
+    invoke-interface {v0}, Landroid/view/SurfaceHolder;->getSurface()Landroid/view/Surface;
+    move-result-object p1
+
+    :check_surface
+    if-eqz p1, :unavailable
+    invoke-virtual {p1}, Landroid/view/Surface;->isValid()Z
+    move-result v0
+    if-eqz v0, :unavailable
+    iget-object v0, v2, Lio/flutter/embedding/engine/renderer/e;->a:Lio/flutter/embedding/engine/FlutterJNI;
+    invoke-virtual {v0, p1}, Lio/flutter/embedding/engine/FlutterJNI;->onSurfaceWindowChanged(Landroid/view/Surface;)V
+    iput-object p1, v2, Lio/flutter/embedding/engine/renderer/e;->c:Landroid/view/Surface;
+    const/4 v0, 0x1
+    return v0
+
+    :unavailable
+    const/4 v0, 0x0
+    return v0
 .end method
 
 .method public onPictureInPictureModeChanged(ZLandroid/content/res/Configuration;)V

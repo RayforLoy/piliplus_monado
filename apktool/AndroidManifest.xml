@@ -84,7 +84,7 @@
         <meta-data android:name="com.oculus.enable_frame_sync" android:value="true" />
         <meta-data android:name="com.oculus.handtracking.frequency" android:value="HIGH" />
         <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false" />
-        <activity android:configChanges="density|fontScale|keyboard|keyboardHidden|layoutDirection|locale|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" android:exported="true" android:hardwareAccelerated="true" android:launchMode="singleTask" android:name="com.example.piliplus.MainActivity" android:resizeableActivity="true" android:screenOrientation="landscape" android:supportsPictureInPicture="true" android:theme="@style/LaunchTheme" android:windowSoftInputMode="adjustResize">
+        <activity android:configChanges="density|fontScale|keyboard|keyboardHidden|layoutDirection|locale|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" android:exported="true" android:hardwareAccelerated="true" android:launchMode="singleTask" android:name="com.example.piliplus.MainActivity" android:resizeableActivity="true" android:screenOrientation="landscape" android:theme="@style/LaunchTheme" android:windowSoftInputMode="adjustResize">
             <layout android:defaultHeight="720dp" android:defaultWidth="1280dp" android:gravity="center" android:minHeight="360dp" android:minWidth="640dp" />
             <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
             <meta-data android:name="flutter_deeplinking_enabled" android:value="false" />
@@ -92,7 +92,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-                <category android:name="com.oculus.intent.category.2D" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>
             <intent-filter android:label="PiliPlus">
                 <action android:name="android.intent.action.VIEW" />
@@ -233,12 +233,6 @@
                 <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
             </intent-filter>
         </receiver>
-            <activity android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode" android:exported="true" android:launchMode="singleTask" android:name="com.example.piliplus.vr.VrPlayerActivity" android:screenOrientation="landscape" android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="com.oculus.intent.category.VR" />
-            </intent-filter>
-            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
-        </activity>
+        <activity android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode" android:exported="false" android:name="com.example.piliplus.vr.VrPlayerActivity" android:screenOrientation="landscape" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
     </application>
 </manifest>

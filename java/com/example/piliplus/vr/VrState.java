@@ -106,7 +106,8 @@ public final class VrState {
         @Override
         public void run() {
             autoEnterScheduled = false;
-            if (vrActive || vrStarting || mpvHandle == 0 || !vrAutoEnter) return;
+            if (!vrAutoEnter || vrActive || vrStarting || mpvHandle == 0
+                    || !Cv10Browser.isBrowsing(main2DActivity)) return;
             if (SystemClock.uptimeMillis() < suppressAutoUntil) return;
 
             int[] sz = videoSize();
@@ -565,7 +566,7 @@ public final class VrState {
     }
 
     private static void scheduleAutoEnter(long delayMs) {
-        if (!vrAutoEnter || vrActive || vrStarting) return;
+        if (!vrAutoEnter || vrActive || vrStarting || !Cv10Browser.isBrowsing(main2DActivity)) return;
         if (SystemClock.uptimeMillis() < suppressAutoUntil) return;
         final Activity a = main2DActivity;
         if (a == null) return;
@@ -628,7 +629,7 @@ public final class VrState {
     }
 
     public static boolean enterVR(Activity activity) {
-        if (activity == null || vrActive || vrStarting) return false;
+        if (!Cv10Browser.isBrowsing(activity) || vrActive || vrStarting) return false;
         if (mpvHandle == 0) {
             Toast.makeText(activity, "请先打开一个视频再进入 VR", Toast.LENGTH_SHORT).show();
             return false;
@@ -637,7 +638,7 @@ public final class VrState {
         vrStarting = true;
         try {
             Intent intent = new Intent(activity, VrPlayerActivity.class);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION | Intent.FLAG_ACTIVITY_NO_USER_ACTION);
             int[] size = videoSize();
             if (size != null) {
                 intent.putExtra("video_w", size[0]);
@@ -655,7 +656,7 @@ public final class VrState {
 
     /** Called by VrPlayerActivity once mpv output has been handed back to Flutter. */
     public static void onVrExited(Activity vrAct) {
-        Log.i(TAG, "Exiting VR mode, back to 2D");
+        Log.i(TAG, "Closing playback and returning to the headset browser");
         // Short suppression: only long enough to swallow the wid-restore / Surface
         // recreation that happens right after exit (which would otherwise instantly
         // re-enter VR). 5s was too long and blocked a genuinely new video the user
@@ -665,25 +666,9 @@ public final class VrState {
         vrStarting = false;
         vrActivity = null;
         VrModeButton.setVisible(mpvHandle != 0);
-        final Activity main = main2DActivity;
         if (vrAct != null && !vrAct.isFinishing()) {
             vrAct.finish();
             try { vrAct.overridePendingTransition(0, 0); } catch (Throwable ignored) {}
-        }
-        if (main != null) {
-            MAIN.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        Intent i = new Intent(main, main.getClass());
-                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-                        main.startActivity(i);
-                        try { main.overridePendingTransition(0, 0); } catch (Throwable ignored) {}
-                    } catch (Throwable t) {
-                        Log.w(TAG, "bring 2D to front failed", t);
-                    }
-                }
-            }, 300);
         }
     }
 
