@@ -12,13 +12,16 @@ final class Cv10Input {
     private static final int TRACKED = 8;
     private static final int SELECT = 16;
     private static final int MENU = 32;
+    private static final int GRIP_PAIR = 1 << 6;
+    private static final int BOTH_SELECT = 1 << 7;
+    private static final int ANY_SELECT = 1 << 8;
 
-    final float[] uv = new float[2];
+    private final float[] values = new float[3];
     private int flags;
     private int pressed;
 
     void poll(XrBridge xr) {
-        int next = read(xr.getNativeHandle(), uv);
+        int next = read(xr.getNativeHandle(), values);
         pressed = next & ~flags;
         flags = next;
     }
@@ -28,12 +31,18 @@ final class Cv10Input {
     }
 
     int hit() { return flags & HIT_MASK; }
+    float u() { return values[0]; }
+    float v() { return values[1]; }
+    float gripSpan() { return values[2]; }
     boolean tracked() { return (flags & TRACKED) != 0; }
+    boolean hasGripPair() { return (flags & GRIP_PAIR) != 0; }
+    boolean bothSelectDown() { return (flags & BOTH_SELECT) != 0; }
+    boolean anySelectDown() { return (flags & ANY_SELECT) != 0; }
     boolean selectDown() { return (flags & SELECT) != 0; }
     boolean selectPressed() { return (pressed & SELECT) != 0; }
     boolean menuPressed() { return (pressed & MENU) != 0; }
 
     static native boolean configureBrowser(long session);
     static native boolean usesSimpleController(long session);
-    private static native int read(long session, float[] uv);
+    private static native int read(long session, float[] values);
 }

@@ -2186,6 +2186,7 @@ bool XrVideoSession::InitControllerActions()
 		return XR_SUCCEEDED(xrCreateAction(controller_actions_, &info, action));
 	};
 	if(!create_action(XR_ACTION_TYPE_POSE_INPUT, "aim", "Aim", &controller_aim_)
+			|| !create_action(XR_ACTION_TYPE_POSE_INPUT, "grip", "Grip", &controller_grip_)
 			|| !create_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "select", "Select", &controller_select_)
 			|| !create_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Back", &controller_menu_))
 		return false;
@@ -2198,7 +2199,8 @@ bool XrVideoSession::InitControllerActions()
 			bindings.push_back({action, path});
 			return true;
 		};
-		if(!bind(controller_aim_, "/input/aim/pose") || !bind(controller_select_, "/input/select/click")
+		if(!bind(controller_aim_, "/input/aim/pose") || !bind(controller_grip_, "/input/grip/pose")
+				|| !bind(controller_select_, "/input/select/click")
 				|| !bind(controller_menu_, "/input/menu/click")) return false;
 	}
 
@@ -2217,6 +2219,11 @@ bool XrVideoSession::InitControllerActions()
 	for(size_t h = 0; h < controller_hands_.size(); ++h) {
 		space_info.subactionPath = controller_hands_[h];
 		if(XR_FAILED(xrCreateActionSpace(session_, &space_info, &controller_spaces_[h]))) return false;
+	}
+	space_info.action = controller_grip_;
+	for(size_t h = 0; h < controller_hands_.size(); ++h) {
+		space_info.subactionPath = controller_hands_[h];
+		if(XR_FAILED(xrCreateActionSpace(session_, &space_info, &controller_grip_spaces_[h]))) return false;
 	}
 
 	XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
@@ -2303,16 +2310,42 @@ void XrVideoSession::UpdateController(XrTime display_time)
 		cursor_visible_[0].store(false);
 		corner_hovered_.store(false);
 	}
+	if(!browser_mode_) {
+		if(hands[0].select || hands[1].select)
+			sample.flags |= ControllerSample::kAnySelect;
+		if(hands[0].select && hands[1].select)
+			sample.flags |= ControllerSample::kBothSelect;
+
+		auto locate_grip = [&](size_t i, XrSpaceLocation &grip) {
+			return hands[i].tracked
+					&& XR_SUCCEEDED(xrLocateSpace(controller_grip_spaces_[i], app_space_, display_time, &grip))
+					&& (grip.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+		};
+		XrSpaceLocation left{XR_TYPE_SPACE_LOCATION}, right{XR_TYPE_SPACE_LOCATION};
+		if(locate_grip(0, left) && locate_grip(1, right)) {
+			const auto &a = left.pose.position;
+			const auto &b = right.pose.position;
+			const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+			const float span = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if(std::isfinite(span)) {
+				sample.flags |= ControllerSample::kGripPair;
+				sample.grip_span = span;
+			}
+		}
+	}
 	if(previous != primary_hand_)
 		LOGI("XR primary pointer %s: left tracked=%d select=%d menu=%d, right tracked=%d select=%d menu=%d",
 				primary_hand_ < 0 ? "none" : (primary_hand_ == 0 ? "left" : "right"),
 				hands[0].tracked,hands[0].select,hands[0].menu,hands[1].tracked,hands[1].select,hands[1].menu);
 
 	std::lock_guard<std::mutex> lock(controller_mutex_);
-	constexpr int transitions = tracked_bit | select_bit | menu_bit;
+	constexpr int transitions = tracked_bit | select_bit | menu_bit | ControllerSample::kPairState;
 	if(previous != primary_hand_ && (controller_latest_.flags & (select_bit | menu_bit)) != 0) {
 		auto released = controller_latest_;
-		released.flags &= ~(select_bit | menu_bit);
+		// Release the old pointer while retaining this frame's physical button state.
+		released.flags &= ~(select_bit | menu_bit | ControllerSample::kPairState);
+		released.flags |= sample.flags & ControllerSample::kPairState;
+		released.grip_span = sample.grip_span;
 		controller_changes_.push_back(released);
 		controller_latest_ = released;
 	}
@@ -2324,7 +2357,7 @@ void XrVideoSession::UpdateController(XrTime display_time)
 			controller_changes_.push_back({});
 			controller_armed_.fill(false);
 			menu_armed_.fill(false);
-			sample.flags &= ~(select_bit | menu_bit);
+			sample.flags &= ~(select_bit | menu_bit | ControllerSample::kBothSelect | ControllerSample::kAnySelect);
 		}
 		controller_changes_.push_back(sample);
 	}

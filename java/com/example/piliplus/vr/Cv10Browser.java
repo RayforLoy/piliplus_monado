@@ -304,7 +304,7 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         }
         if (!input.selectPressed()) return;
         if (input.hit() == Cv10Input.HUD) {
-            handleHud(input.uv[0] * HUD_WIDTH, input.uv[1] * HUD_HEIGHT);
+            handleHud(input.u() * HUD_WIDTH, input.v() * HUD_HEIGHT);
         } else if (input.hit() == Cv10Input.SCREEN) {
             touchDownTime = SystemClock.uptimeMillis();
             dragging = false;
@@ -314,9 +314,9 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         }
     }
 
-    private float pointerX() { return Math.min(width - 1, input.uv[0] * width); }
+    private float pointerX() { return Math.min(width - 1, input.u() * width); }
 
-    private float pointerY() { return Math.min(height - 1, input.uv[1] * height); }
+    private float pointerY() { return Math.min(height - 1, input.v() * height); }
 
     private void cancelTouch() {
         if (touchDownTime == 0) return;

@@ -89,6 +89,13 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private boolean touchActive = false;
     private boolean simpleController;
     private final Cv10Input cv10Input = new Cv10Input();
+    private static final float MIN_DUAL_GRIP_SPAN = 0.06f;
+    private static final float DUAL_GRIP_DEADBAND = 0.005f;
+    private int pendingCv10Hit = -1;
+    private float pendingCv10U, pendingCv10V;
+    private boolean dualSelectConsumed;
+    private boolean dualResizeChanged;
+    private float dualResizeStartSpan, dualResizeStartFov, dualResizeLastSpan;
     /** Default VR background on entry (true = passthrough, false = pitch black), configurable in HUD settings. */
     private boolean defaultPassthrough = true;
     private boolean passthrough = true;
@@ -628,6 +635,9 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             try { TouchInput.detach(); } catch (Throwable ignored) {}
             touchActive = false;
         }
+        finishCv10Resize();
+        dualSelectConsumed = false;
+        pendingCv10Hit = -1;
         cv10Input.reset();
 
         if (vrWid != 0) {
@@ -2864,7 +2874,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         if (touchActive) {
             handleTouch();
         }
-        boolean javaManipulating = isScreenDragging || isCtrlCornerResizing || sizeStickEngaged || distStickEngaged;
+        boolean javaManipulating = isScreenDragging || isCtrlCornerResizing || sizeStickEngaged
+                || distStickEngaged || dualResizeStartSpan > 0f;
         if (javaManipulating != lastJavaManipulating) {
             lastJavaManipulating = javaManipulating;
             try { AiDepthNative.setScreenManipulating(javaManipulating); } catch (Throwable ignored) {}
@@ -3532,23 +3543,101 @@ public final class VrPlayerActivity extends Activity implements Runnable {
 
     private void handleCv10Input() {
         cv10Input.poll(xr);
+        long now = SystemClock.uptimeMillis();
+        if (handleCv10Resize(now)) return;
         if (cv10Input.menuPressed()) {
+            pendingCv10Hit = -1;
             if (settingsOpen) toggleSettingsPanel();
             else exitVr();
             return;
         }
-        if (!cv10Input.selectPressed() || xr == null || !isRunning || !cv10Input.tracked()) return;
-        final long now = SystemClock.uptimeMillis();
+        if (!cv10Input.tracked()) {
+            pendingCv10Hit = -1;
+            return;
+        }
+
+        boolean canResize = projectionMode == 0 && cv10Input.hasGripPair();
+        if (!canResize) pendingCv10Hit = -1;
+        if (pendingCv10Hit >= 0 && !cv10Input.selectDown()) {
+            int hit = pendingCv10Hit;
+            pendingCv10Hit = -1;
+            activateCv10Selection(hit, pendingCv10U, pendingCv10V, now);
+        } else if (cv10Input.selectPressed()) {
+            if (canResize) {
+                // A held confirm can still become a chord until either hand releases.
+                pendingCv10Hit = cv10Input.hit();
+                pendingCv10U = cv10Input.u();
+                pendingCv10V = cv10Input.v();
+                noteCv10Interaction(now);
+            } else {
+                activateCv10Selection(cv10Input.hit(), cv10Input.u(), cv10Input.v(), now);
+            }
+        }
+    }
+
+    private boolean handleCv10Resize(long now) {
+        if (projectionMode == 0 && cv10Input.bothSelectDown()) {
+            pendingCv10Hit = -1;
+            dualSelectConsumed = true;
+            noteCv10Interaction(now);
+            if (!cv10Input.hasGripPair()) {
+                finishCv10Resize();
+                return true;
+            }
+            float span = cv10Input.gripSpan();
+            if (dualResizeStartSpan == 0f) {
+                if (span >= MIN_DUAL_GRIP_SPAN) {
+                    dualResizeStartSpan = dualResizeLastSpan = span;
+                    dualResizeStartFov = screenFov;
+                    Log.i(TAG, "Dual-controller resize started, span=" + span + " m");
+                }
+                return true;
+            }
+            if (Math.abs(span - dualResizeLastSpan) >= DUAL_GRIP_DEADBAND) {
+                dualResizeLastSpan = span;
+                float nextFov = clamp(dualResizeStartFov * span / dualResizeStartSpan, MIN_FOV, MAX_FOV);
+                if (Math.abs(nextFov - screenFov) > 1e-4f) {
+                    screenFov = nextFov;
+                    dualResizeChanged = true;
+                    pushScreenParams(false);
+                    if (now - lastSizeOsdAt > 120L) {
+                        lastSizeOsdAt = now;
+                        showResizeOsd("画面尺寸 " + Math.round(screenFov / DEFAULT_FOV * 100f) + "%");
+                    }
+                }
+            }
+            return true;
+        }
+        if (!dualSelectConsumed) return false;
+
+        finishCv10Resize();
+        dualSelectConsumed = cv10Input.anySelectDown();
+        return true;
+    }
+
+    private void finishCv10Resize() {
+        dualResizeStartSpan = 0f;
+        if (!dualResizeChanged) return;
+        dualResizeChanged = false;
+        saveScreenPrefs();
+        Log.i(TAG, "Dual-controller resize saved, fov=" + screenFov + " rad");
+    }
+
+    private void noteCv10Interaction(long now) {
         lastInteractionAt = lastHudActionTime = now;
         hudHideTimeoutMs = 7000L;
+    }
+
+    private void activateCv10Selection(int hit, float u, float v, long now) {
+        noteCv10Interaction(now);
         if (!isHudVisible) {
             isHudVisible = true;
             xr.setHudVisible(true);
             updateHud();
-        } else if (cv10Input.hit() == Cv10Input.HUD) {
-            handleHudClick(cv10Input.uv[0], cv10Input.uv[1]);
-        } else if (cv10Input.hit() == Cv10Input.SETTINGS && settingsOpen) {
-            if (hudRenderer.handleSettingsClick(cv10Input.uv[0], cv10Input.uv[1], this, qualityOptions)) {
+        } else if (hit == Cv10Input.HUD) {
+            handleHudClick(u, v);
+        } else if (hit == Cv10Input.SETTINGS && settingsOpen) {
+            if (hudRenderer.handleSettingsClick(u, v, this, qualityOptions)) {
                 updateSettingsPanel();
                 updateHud();
             }

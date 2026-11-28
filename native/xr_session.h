@@ -218,9 +218,15 @@ enum class RenderPath
 // Lower three bits identify the panel hit (screen 1, HUD 2, settings 3).
 struct ControllerSample
 {
+	static constexpr int kGripPair = 1 << 6;
+	static constexpr int kBothSelect = 1 << 7;
+	static constexpr int kAnySelect = 1 << 8;
+	static constexpr int kPairState = kGripPair | kBothSelect | kAnySelect;
+
 	int flags = 0;
 	float u = 0;
 	float v = 0;
+	float grip_span = 0;
 };
 
 class XrVideoSession
@@ -492,9 +498,11 @@ private:
 
 	XrActionSet controller_actions_ = XR_NULL_HANDLE;
 	XrAction controller_aim_ = XR_NULL_HANDLE;
+	XrAction controller_grip_ = XR_NULL_HANDLE;
 	XrAction controller_select_ = XR_NULL_HANDLE;
 	XrAction controller_menu_ = XR_NULL_HANDLE;
 	std::array<XrSpace, 2> controller_spaces_{};
+	std::array<XrSpace, 2> controller_grip_spaces_{};
 	int primary_hand_ = -1;
 	ControllerModelLayer controller_model_;
 	bool model_extensions_ = false;

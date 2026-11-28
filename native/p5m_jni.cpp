@@ -59,13 +59,13 @@ JNIEXPORT jboolean JNICALL Java_com_example_piliplus_vr_Cv10Input_usesSimpleCont
 }
 
 JNIEXPORT jint JNICALL Java_com_example_piliplus_vr_Cv10Input_read(
-		JNIEnv *env, jclass, jlong ptr, jfloatArray uv)
+		JNIEnv *env, jclass, jlong ptr, jfloatArray values)
 {
-	if(!ptr || !uv || env->GetArrayLength(uv) < 2)
+	if(!ptr || !values || env->GetArrayLength(values) < 3)
 		return 0;
 	const auto sample = Handle(ptr)->ReadController();
-	const jfloat coords[] = {sample.u, sample.v};
-	env->SetFloatArrayRegion(uv, 0, 2, coords);
+	const jfloat coords[] = {sample.u, sample.v, sample.grip_span};
+	env->SetFloatArrayRegion(values, 0, 3, coords);
 	return sample.flags;
 }
 
