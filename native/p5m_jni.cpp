@@ -460,8 +460,7 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetResolutionBadgeVisible)(JNIEnv *, jobjec
 		Handle(ptr)->SetResVisible(visible == JNI_TRUE);
 }
 
-JNIEXPORT void JNICALL JNI_FCN(nativeSetDanmakuBitmap)(JNIEnv *env, jobject, jlong ptr,
-		jobject bitmap)
+static void SetTextBitmap(JNIEnv *env, jlong ptr, jobject bitmap, p5m::CinemaTextBands bands)
 {
 	if(!ptr || !bitmap)
 		return;
@@ -476,8 +475,21 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetDanmakuBitmap)(JNIEnv *env, jobject, jlo
 	if(AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
 		return;
 	Handle(ptr)->SetDanmakuBitmap(static_cast<const uint8_t *>(pixels), (int32_t)info.width,
-			(int32_t)info.height, info.stride);
+			(int32_t)info.height, info.stride, bands);
 	AndroidBitmap_unlockPixels(env, bitmap);
+}
+
+JNIEXPORT void JNICALL JNI_FCN(nativeSetDanmakuBitmap)(JNIEnv *env, jobject, jlong ptr,
+		jobject bitmap)
+{
+	SetTextBitmap(env, ptr, bitmap, {});
+}
+
+JNIEXPORT void JNICALL Java_com_example_piliplus_vr_VrDanmakuEngine_submitCinemaText(
+		JNIEnv *env, jclass, jlong ptr, jobject bitmap, jint danmaku_height,
+		jboolean danmaku, jboolean subtitle)
+{
+	SetTextBitmap(env, ptr, bitmap, {danmaku_height, danmaku == JNI_TRUE, subtitle == JNI_TRUE});
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeSetDanmakuVisible)(JNIEnv *, jobject, jlong ptr,

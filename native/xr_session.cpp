@@ -223,6 +223,14 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 	};
 
 	std::vector<const char *> extensions;
+	model_extensions_ = has_ext(XR_EXT_RENDER_MODEL_EXTENSION_NAME)
+			&& has_ext(XR_EXT_INTERACTION_RENDER_MODEL_EXTENSION_NAME);
+	if(model_extensions_) {
+		if(has_ext(XR_EXT_UUID_EXTENSION_NAME))
+			extensions.push_back(XR_EXT_UUID_EXTENSION_NAME);
+		extensions.push_back(XR_EXT_RENDER_MODEL_EXTENSION_NAME);
+		extensions.push_back(XR_EXT_INTERACTION_RENDER_MODEL_EXTENSION_NAME);
+	}
 	// Obrigatorias: sem qualquer uma delas o projeto nao existe.
 	const char *required[] = {
 		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
@@ -499,6 +507,7 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 				max_swapchain_width_ = sys_props.graphicsProperties.maxSwapchainImageWidth;
 			if(sys_props.graphicsProperties.maxSwapchainImageHeight > 0)
 				max_swapchain_height_ = sys_props.graphicsProperties.maxSwapchainImageHeight;
+			max_layer_count_ = sys_props.graphicsProperties.maxLayerCount;
 			LOGI("System graphics caps: maxSwapchain=%ux%u maxLayers=%u",
 					sys_props.graphicsProperties.maxSwapchainImageWidth,
 					sys_props.graphicsProperties.maxSwapchainImageHeight,
@@ -566,6 +575,11 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 			{
 				view_count_ = count;
 				views_.assign(count, XrView{XR_TYPE_VIEW});
+				if(count == 2) {
+					const uint32_t width = std::max(config[0].recommendedImageRectWidth,config[1].recommendedImageRectWidth);
+					const uint32_t height = std::max(config[0].recommendedImageRectHeight,config[1].recommendedImageRectHeight);
+					pointer_eye_size_ = {int(std::min(width,max_swapchain_width_/2)),int(std::min(height,max_swapchain_height_))};
+				}
 				LOGI("Views: %u, recommended %ux%u", count,
 						config[0].recommendedImageRectWidth,
 						config[0].recommendedImageRectHeight);
@@ -1229,6 +1243,41 @@ void XrVideoSession::SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t 
 	hud_dirty_count_.store((int)std::max((size_t)3, hud_images_.size()));
 }
 
+static XrPosef PoseOnScreenAxes(float yaw, float pitch, const XrVector3f &origin,
+		float local_y, float distance)
+{
+	const XrQuaternionf orientation = QuatFromYawPitch(yaw, pitch);
+	const XrVector3f offset = RotateVector(orientation, {0.0f, local_y, -distance});
+	return {orientation, {origin.x + offset.x, origin.y + offset.y, origin.z + offset.z}};
+}
+
+struct HudGeometry
+{
+	XrPosef pose;
+	XrExtent2Df size;
+};
+
+static HudGeometry GetHudGeometry(bool browser, float yaw, float pitch,
+		const ScreenParams &params, const XrVector3f &recenter_pos)
+{
+	const float half_height = std::tan(params.centralAngle * 0.5f) / std::max(0.2f, params.aspectRatio);
+	if(browser)
+	{
+		// The toolbar starts at the top of its texture. Keep the entire hit quad
+		// below the Flutter quad, on the same plane even when the user recenters.
+		const float distance = std::max(0.5f, params.radius);
+		const float width = distance * 0.68f;
+		const float height = width * (float)kHudHeight / (float)kHudWidth;
+		const float center_y = -distance * (half_height + 0.045f) - height * 0.5f;
+		return {PoseOnScreenAxes(yaw, pitch, recenter_pos, center_y, distance), {width, height}};
+	}
+	const float width = kHudWidth1M * kFixedUiDist / 1.45f;
+	const float height_angle = (params.radius > 0.1f) ? std::atan2(params.heightOffset, params.radius) : 0.0f;
+	const float hud_pitch = pitch + height_angle - std::clamp(std::atan(half_height) + 0.08f, 0.22f, 0.55f);
+	return {PoseOnScreenAxes(yaw, hud_pitch, recenter_pos, 0.0f, kFixedUiDist),
+			{width, width * (float)kHudHeight / (float)kHudWidth}};
+}
+
 bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw, float pitch, const ScreenParams &params, const XrVector3f &recenter_pos)
 {
 	if(hud_swapchain_ == XR_NULL_HANDLE || hud_images_.empty())
@@ -1297,21 +1346,9 @@ bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw, fl
 	}
 
 
-	const float hud_dist = kFixedUiDist;
-	float hud_scale = hud_dist / 1.45f;
-	layer.size = XrExtent2Df{kHudWidth1M * hud_scale, kHudWidth1M * hud_scale * (float)kHudHeight / (float)kHudWidth};
-	float half_v_angle = std::atan(std::tan(params.centralAngle * 0.5f) / std::max(0.2f, params.aspectRatio));
-	float height_angle = (params.radius > 0.1f) ? std::atan2(params.heightOffset, params.radius) : 0.0f;
-	float down_angle = std::clamp(half_v_angle + 0.08f, 0.22f, 0.55f);
-	float hud_pitch = pitch + height_angle - down_angle;
-	float cos_p = std::cos(hud_pitch);
-	float sin_p = std::sin(hud_pitch);
-	layer.pose.orientation = QuatFromYawPitch(yaw, hud_pitch);
-	layer.pose.position = XrVector3f{
-		recenter_pos.x - std::sin(yaw) * cos_p * hud_dist,
-		recenter_pos.y + sin_p * hud_dist,
-		recenter_pos.z - std::cos(yaw) * cos_p * hud_dist
-	};
+	const auto hud = GetHudGeometry(browser_mode_, yaw, pitch, params, recenter_pos);
+	layer.size = hud.size;
+	layer.pose = hud.pose;
 	return true;
 }
 
@@ -1509,19 +1546,6 @@ bool XrVideoSession::UpdateResLayer(XrCompositionLayerQuad &layer, float yaw, fl
 
 // Frame-tagged 2-slot danmaku queue. The worker wakes at the START of XR frame N
 // (WaitForXrFrame returns seq N) and draws the bitmap for frame N+1's display time.
-// Under danmaku_mutex_, SetDanmakuBitmap places the frame into one of two slots
-// tagged with wake seq N, and UpdateDanmakuLayer only consumes slots with tag < cur_seq.
-struct DanmakuSlot
-{
-	std::vector<uint8_t> pixels;
-	int32_t w = 0;
-	int32_t h = 0;
-	int32_t copy_h = 0;
-	uint64_t tag_seq = 0;
-	bool stereo = false;
-	bool valid = false;
-};
-static DanmakuSlot g_dm_slots[2];
 static std::atomic<uint64_t> g_dm_wake_seq{0};
 static std::atomic<int32_t> g_dm_upload_h_hint{0};
 static std::atomic<bool> g_danmaku_is_stereo{false};
@@ -1534,16 +1558,19 @@ void SetDanmakuUploadHeightHint(int32_t height)
 }
 
 void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height,
-                                     size_t source_stride)
+                                     size_t source_stride, CinemaTextBands bands)
 {
-	if(!pixels || width <= 0 || height <= 0)
+	if(!pixels || width <= 0 || height <= 0 || width > kDanmakuWidth || height > kDanmakuHeight
+			|| bands.danmaku_height < 0 || bands.danmaku_height >= height)
 		return;
 	const size_t row_bytes = (size_t)width * 4;
 	if(source_stride < row_bytes)
 		return;
 	const int32_t hint_h = g_dm_upload_h_hint.load(std::memory_order_acquire);
-	const bool stereo = g_danmaku_is_stereo.load() && danmaku_swapchain_right_ != XR_NULL_HANDLE;
-	const int32_t copy_h = (!stereo && hint_h > 0 && hint_h < height) ? hint_h : height;
+	const bool cinema_bands = bands.danmaku_height > 0;
+	const bool stereo = !cinema_bands && g_danmaku_is_stereo.load()
+			&& danmaku_swapchain_right_ != XR_NULL_HANDLE;
+	const int32_t copy_h = (!stereo && !bands.subtitle && hint_h > 0 && hint_h < height) ? hint_h : height;
 	const uint64_t wake_seq = g_dm_wake_seq.load(std::memory_order_acquire);
 	std::lock_guard<std::mutex> writeLock(danmaku_write_mutex_);
 	danmaku_staging_pixels_.resize(row_bytes * copy_h);
@@ -1563,23 +1590,27 @@ void XrVideoSession::SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int3
 		int target = -1;
 		for(int i = 0; i < 2; i++)
 		{
-			if(!g_dm_slots[i].valid)
+			if(danmaku_slots_[i].upload.valid && danmaku_slots_[i].frame == wake_seq)
 			{
 				target = i;
 				break;
 			}
+			if(!danmaku_slots_[i].upload.valid)
+				target = i;
 		}
 		if(target < 0)
 		{
-			target = (g_dm_slots[0].tag_seq <= g_dm_slots[1].tag_seq) ? 0 : 1;
+			target = (danmaku_slots_[0].frame <= danmaku_slots_[1].frame) ? 0 : 1;
 		}
-		g_dm_slots[target].pixels.swap(danmaku_staging_pixels_);
-		g_dm_slots[target].w = width;
-		g_dm_slots[target].h = height;
-		g_dm_slots[target].copy_h = copy_h;
-		g_dm_slots[target].stereo = stereo;
-		g_dm_slots[target].tag_seq = wake_seq;
-		g_dm_slots[target].valid = true;
+		auto &slot = danmaku_slots_[target];
+		slot.upload.pixels.swap(danmaku_staging_pixels_);
+		slot.upload.width = width;
+		slot.upload.height = height;
+		slot.upload.copy_height = copy_h;
+		slot.upload.stereo = stereo;
+		slot.upload.bands = bands;
+		slot.frame = wake_seq;
+		slot.upload.valid = true;
 	}
 }
 
@@ -1722,27 +1753,45 @@ void XrVideoSession::SetLoadingReady(bool ready)
 		video_layer_enabled_.store(true);
 }
 
-bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCompositionLayerCylinderKHR &cyl_right, XrCompositionLayerQuad &quad, XrCompositionLayerQuad &quad_right, bool &out_is_quad, bool &out_is_stereo, float yaw, float pitch, const ScreenParams &params, const XrVector3f &recenter_pos)
+static XrCompositionLayerQuad MakeCinemaTextBand(XrSpace space, XrSwapchain swapchain,
+		XrRect2Di rect, float yaw, float pitch, const XrVector3f &origin,
+		float distance, float width, float video_edge_slope, bool above)
 {
-	out_is_stereo = false;
+	XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+	quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	quad.space = space;
+	quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	quad.subImage.swapchain = swapchain;
+	quad.subImage.imageRect = rect;
+	const float height = width * (float)rect.extent.height / (float)rect.extent.width;
+	quad.size = {width, height};
+	const float center = distance * (video_edge_slope + 0.045f) + height * 0.5f;
+	quad.pose = PoseOnScreenAxes(yaw, pitch, origin, above ? center : -center, distance);
+	return quad;
+}
+
+static XrRect2Di CinemaBandRect(int32_t width, int32_t height, int32_t upper_height,
+		bool upper_band, bool runtime_flips)
+{
+	// Canvas rows are bottom-up in GLES unless the runtime flips the layer.
+	const int32_t lower_height = height - upper_height;
+	if(upper_band)
+		return {{0, runtime_flips ? 0 : lower_height}, {width, upper_height}};
+	return {{0, runtime_flips ? upper_height : 0}, {width, lower_height}};
+}
+
+bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCompositionLayerCylinderKHR &cyl_right,
+		XrCompositionLayerQuad &quad, XrCompositionLayerQuad &quad_right, uint32_t &out_quad_mask,
+		bool &out_stereo_cylinder, float yaw, float pitch, const ScreenParams &params,
+		const XrVector3f &recenter_pos)
+{
+	out_quad_mask = 0;
+	out_stereo_cylinder = false;
 	if(danmaku_swapchain_ == XR_NULL_HANDLE || danmaku_images_.empty())
 		return false;
 
 	const bool is_stereo = g_danmaku_is_stereo.load() && (danmaku_swapchain_right_ != XR_NULL_HANDLE);
 	const float span_x = is_stereo ? ComputeTrackSpanX(params.aspectRatio) : std::max(0.5f, g_danmaku_span_x.load());
-
-	int32_t active_w = kDanmakuWidth;
-	int32_t active_h = kDanmakuHeight;
-	{
-		std::lock_guard<std::mutex> lock(danmaku_mutex_);
-		if(danmaku_width_ > 0 && danmaku_height_ > 0)
-		{
-			active_w = std::min(danmaku_width_, kDanmakuWidth);
-			active_h = std::min(danmaku_height_, kDanmakuHeight);
-			if(is_stereo && active_h > 1)
-				active_h = active_h / 2;
-		}
-	}
 
 	auto clearSwapchainTexIfNeeded = [&](GLuint texId, std::vector<uint32_t> &gens, uint32_t idx, uint32_t targetGen) {
 		if(idx >= gens.size() || gens[idx] == targetGen)
@@ -1767,44 +1816,31 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 		gens[idx] = targetGen;
 	};
 
-	int32_t up_w = 0;
-	int32_t up_h = 0;
-	int32_t up_copy_h = 0;
 	{
+		// Consume an older frame and keep its crop and visibility with its pixels.
 		const uint64_t cur_seq = g_xr_frame_seq.load(std::memory_order_acquire);
 		std::lock_guard<std::mutex> lock(danmaku_mutex_);
 		int best = -1;
 		for(int i = 0; i < 2; i++)
 		{
-			if(g_dm_slots[i].valid && g_dm_slots[i].tag_seq < cur_seq)
+			const auto &slot = danmaku_slots_[i];
+			if(slot.upload.valid && slot.frame < cur_seq && slot.upload.stereo == is_stereo)
 			{
-				if(best < 0 || g_dm_slots[i].tag_seq > g_dm_slots[best].tag_seq)
+				if(best < 0 || slot.frame >= danmaku_slots_[best].frame)
 					best = i;
 			}
 		}
 		if(best >= 0)
-		{
-			if(g_dm_slots[best].stereo == is_stereo
-					&& !g_dm_slots[best].pixels.empty() && g_dm_slots[best].w > 0 && g_dm_slots[best].h > 0
-					&& g_dm_slots[best].w <= kDanmakuWidth && g_dm_slots[best].h <= kDanmakuHeight)
-			{
-				danmaku_upload_pixels_.swap(g_dm_slots[best].pixels);
-				up_w = g_dm_slots[best].w;
-				up_h = g_dm_slots[best].h;
-				up_copy_h = std::clamp(g_dm_slots[best].copy_h, 1, up_h);
-				danmaku_width_ = up_w;
-				danmaku_height_ = up_h;
-			}
-			g_dm_slots[best].valid = false;
-			for(int i = 0; i < 2; i++)
-			{
-				if(g_dm_slots[i].valid && g_dm_slots[i].tag_seq < cur_seq)
-					g_dm_slots[i].valid = false;
-			}
-		}
+			std::swap(danmaku_upload_, danmaku_slots_[best].upload);
+		for(auto &slot : danmaku_slots_)
+			if(slot.frame < cur_seq)
+				slot.upload.valid = false;
 	}
 
-	if(up_w > 0 && up_h > 0 && !danmaku_upload_pixels_.empty())
+	auto &upload = danmaku_upload_;
+	if(upload.valid && upload.stereo != is_stereo)
+		upload.valid = false;
+	if(upload.valid)
 	{
 		XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 		if(!danmaku_swapchain_acquired_)
@@ -1820,9 +1856,9 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 			XrResult wait_res = xrWaitSwapchainImage(danmaku_swapchain_, &wait);
 			if(wait_res == XR_SUCCESS)
 			{
-				active_w = up_w;
-				active_h = up_h;
-				int32_t check_h = (is_stereo && active_h > 1) ? (active_h / 2) : active_h;
+				const int32_t active_w = upload.width;
+				const int32_t active_h = upload.height;
+				const int32_t check_h = is_stereo ? active_h / 2 : active_h;
 				if(active_w != danmaku_last_up_w_ || check_h != danmaku_last_up_h_ || is_stereo != danmaku_last_up_stereo_)
 				{
 					danmaku_last_up_w_ = active_w;
@@ -1840,7 +1876,7 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, active_w, eye_h,
-							GL_RGBA, GL_UNSIGNED_BYTE, danmaku_upload_pixels_.data());
+							GL_RGBA, GL_UNSIGNED_BYTE, upload.pixels.data());
 					glBindTexture(GL_TEXTURE_2D, 0);
 
 					if(danmaku_swapchain_right_ != XR_NULL_HANDLE && !danmaku_images_right_.empty())
@@ -1856,7 +1892,7 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 							if(xrWaitSwapchainImage(danmaku_swapchain_right_, &wait) == XR_SUCCESS)
 							{
 								clearSwapchainTexIfNeeded(danmaku_images_right_[idx_r].image, danmaku_img_clear_gen_right_, idx_r, danmaku_clear_gen_);
-								const uint8_t *right_ptr = danmaku_upload_pixels_.data() + ((size_t)active_w * eye_h * 4);
+								const uint8_t *right_ptr = upload.pixels.data() + ((size_t)active_w * eye_h * 4);
 								glBindTexture(GL_TEXTURE_2D, danmaku_images_right_[idx_r].image);
 								glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 								glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1870,7 +1906,6 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 							}
 						}
 					}
-					active_h = eye_h;
 				}
 				else
 				{
@@ -1879,13 +1914,17 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 					glBindTexture(GL_TEXTURE_2D, danmaku_images_[index].image);
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-					const int32_t partial_h = std::min(up_copy_h, active_h);
+					const int32_t partial_h = upload.copy_height;
 					const int32_t upload_y = image_layout_supported_ ? 0 : active_h - partial_h;
 					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, upload_y, active_w, partial_h,
-							GL_RGBA, GL_UNSIGNED_BYTE, danmaku_upload_pixels_.data());
+							GL_RGBA, GL_UNSIGNED_BYTE, upload.pixels.data());
 					glBindTexture(GL_TEXTURE_2D, 0);
 				}
 				danmaku_has_image_.store(true);
+				danmaku_displayed_bands_ = upload.bands;
+				danmaku_width_ = active_w;
+				danmaku_height_ = check_h;
+				upload.valid = false;
 				XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 				xrReleaseSwapchainImage(danmaku_swapchain_, &release);
 				danmaku_swapchain_acquired_ = false;
@@ -1899,8 +1938,50 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 		}
 	}
 
-	if(!danmaku_has_image_.load() || (is_stereo && !danmaku_right_has_image_.load()))
+	if(!danmaku_has_image_.load() || danmaku_last_up_stereo_ != is_stereo
+			|| (is_stereo && !danmaku_right_has_image_.load()))
 		return false;
+
+	const int32_t active_w = danmaku_width_;
+	const int32_t active_h = danmaku_height_;
+	const CinemaTextBands bands = danmaku_displayed_bands_;
+	if(bands.danmaku_height > 0)
+	{
+		if(projection_mode_.load() != 0)
+			return false;
+		const float half_width = std::tan(std::min(params.centralAngle, 3.05f) * 0.5f);
+		const float aspect = std::max(0.2f, params.aspectRatio);
+		float video_edge_slope = half_width / aspect;
+		if(layer_shape_.load() == LayerShape::Cylinder)
+		{
+			// Use the nearest edge of the curve when clearing the video silhouette.
+			const float curvature = params.curvature > 0.001f ? params.curvature : 0.1f;
+			const float arc = std::min(5.5f, 2.0f * curvature * half_width);
+			const float near_edge = std::max(0.15f,
+					1.0f - (1.0f - std::cos(arc * 0.5f)) / curvature);
+			video_edge_slope = arc / (2.0f * curvature * aspect * near_edge);
+		}
+		const float danmaku_distance = params.radius * (0.60f + 0.27f * g_danmaku_depth_factor.load());
+		const float subtitle_distance = params.radius * 0.92f;
+		const XrVector3f origin{recenter_pos.x, recenter_pos.y + params.heightOffset, recenter_pos.z};
+		if(bands.danmaku)
+		{
+			const auto rect = CinemaBandRect(active_w, active_h, bands.danmaku_height, true, image_layout_supported_);
+			const float width = 2.0f * danmaku_distance * std::clamp(half_width * span_x, 0.28f, 0.62f);
+			quad = MakeCinemaTextBand(app_space_, danmaku_swapchain_, rect, yaw, pitch, origin,
+					danmaku_distance, width, video_edge_slope, true);
+			out_quad_mask |= 1;
+		}
+		if(bands.subtitle)
+		{
+			const auto rect = CinemaBandRect(active_w, active_h, bands.danmaku_height, false, image_layout_supported_);
+			const float width = 2.0f * subtitle_distance * std::clamp(half_width, 0.28f, 0.62f);
+			quad_right = MakeCinemaTextBand(app_space_, danmaku_swapchain_, rect, yaw, pitch, origin,
+					subtitle_distance, width, video_edge_slope, false);
+			out_quad_mask |= 2;
+		}
+		return out_quad_mask != 0;
+	}
 
 	const float span_y = std::max(0.5f, g_danmaku_span_y.load());
 	const float dm_aspect = (active_h > 0) ? ((float)active_w / (float)active_h) : (std::max(0.2f, params.aspectRatio) * (span_x / span_y));
@@ -1913,7 +1994,6 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 
 	if(layer_shape_.load() == LayerShape::Cylinder || force_cylinder)
 	{
-		out_is_quad = false;
 		cyl.type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
 		cyl.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 		cyl.space = app_space_;
@@ -1951,13 +2031,13 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 			cyl_right = cyl;
 			cyl_right.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
 			cyl_right.subImage.swapchain = danmaku_swapchain_right_;
-			out_is_stereo = true;
+			out_stereo_cylinder = true;
 		}
 		return true;
 	}
 	else
 	{
-		out_is_quad = true;
+		out_quad_mask = is_stereo ? 3 : 1;
 		quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 		quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 		quad.space = app_space_;
@@ -1981,7 +2061,6 @@ bool XrVideoSession::UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCo
 			quad_right = quad;
 			quad_right.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
 			quad_right.subImage.swapchain = danmaku_swapchain_right_;
-			out_is_stereo = true;
 		}
 		return true;
 	}
@@ -2092,7 +2171,9 @@ bool XrVideoSession::InitControllerActions()
 	std::strcpy(set_info.localizedActionSetName, "PiliPlus controls");
 	if(XR_FAILED(xrCreateActionSet(instance_, &set_info, &controller_actions_)))
 		return false;
-	if(XR_FAILED(xrStringToPath(instance_, "/user/hand/right", &controller_hand_)))
+	const char *hands[] = {"/user/hand/left", "/user/hand/right"};
+	if(XR_FAILED(xrStringToPath(instance_, hands[0], &controller_hands_[0]))
+			|| XR_FAILED(xrStringToPath(instance_, hands[1], &controller_hands_[1])))
 		return false;
 
 	auto create_action = [&](XrActionType type, const char *name, const char *label, XrAction *action) {
@@ -2100,8 +2181,8 @@ bool XrVideoSession::InitControllerActions()
 		info.actionType = type;
 		std::strcpy(info.actionName, name);
 		std::strcpy(info.localizedActionName, label);
-		info.countSubactionPaths = 1;
-		info.subactionPaths = &controller_hand_;
+		info.countSubactionPaths = controller_hands_.size();
+		info.subactionPaths = controller_hands_.data();
 		return XR_SUCCEEDED(xrCreateAction(controller_actions_, &info, action));
 	};
 	if(!create_action(XR_ACTION_TYPE_POSE_INPUT, "aim", "Aim", &controller_aim_)
@@ -2109,19 +2190,17 @@ bool XrVideoSession::InitControllerActions()
 			|| !create_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Back", &controller_menu_))
 		return false;
 
-	std::array<XrActionSuggestedBinding, 3> bindings{{
-		{controller_aim_, XR_NULL_PATH},
-		{controller_select_, XR_NULL_PATH},
-		{controller_menu_, XR_NULL_PATH},
-	}};
-	const char *paths[] = {
-		"/user/hand/right/input/aim/pose",
-		"/user/hand/right/input/select/click",
-		"/user/hand/right/input/menu/click",
-	};
-	for(size_t i = 0; i < bindings.size(); ++i)
-		if(XR_FAILED(xrStringToPath(instance_, paths[i], &bindings[i].binding)))
-			return false;
+	std::vector<XrActionSuggestedBinding> bindings;
+	for(const char *hand : hands) {
+		const auto bind = [&](XrAction action, const char *suffix) {
+			XrPath path = XR_NULL_PATH;
+			if(XR_FAILED(xrStringToPath(instance_, (std::string(hand) + suffix).c_str(), &path))) return false;
+			bindings.push_back({action, path});
+			return true;
+		};
+		if(!bind(controller_aim_, "/input/aim/pose") || !bind(controller_select_, "/input/select/click")
+				|| !bind(controller_menu_, "/input/menu/click")) return false;
+	}
 
 	XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
 	if(XR_FAILED(xrStringToPath(instance_, "/interaction_profiles/khr/simple_controller",
@@ -2134,10 +2213,11 @@ bool XrVideoSession::InitControllerActions()
 
 	XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
 	space_info.action = controller_aim_;
-	space_info.subactionPath = controller_hand_;
 	space_info.poseInActionSpace.orientation.w = 1.0f;
-	if(XR_FAILED(xrCreateActionSpace(session_, &space_info, &controller_space_)))
-		return false;
+	for(size_t h = 0; h < controller_hands_.size(); ++h) {
+		space_info.subactionPath = controller_hands_[h];
+		if(XR_FAILED(xrCreateActionSpace(session_, &space_info, &controller_spaces_[h]))) return false;
+	}
 
 	XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
 	attach.countActionSets = 1;
@@ -2156,73 +2236,94 @@ void XrVideoSession::DestroyControllerActions()
 
 void XrVideoSession::UpdateController(XrTime display_time)
 {
+	controller_aim_valid_ = false;
 	if(!controller_attached_)
 		return;
 
 	constexpr int tracked_bit = 8;
 	constexpr int select_bit = 16;
 	constexpr int menu_bit = 32;
-	XrActiveActionSet active{controller_actions_, controller_hand_};
+	XrActiveActionSet active{controller_actions_, XR_NULL_PATH};
 	XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
 	sync.countActiveActionSets = 1;
 	sync.activeActionSets = &active;
 
+	struct HandInput {
+		XrPosef pose{};
+		bool tracked = false, select = false, menu = false;
+	};
+	std::array<HandInput, 2> hands{};
 	ControllerSample sample;
-	bool select_active = false;
-	bool select_down = false;
-	bool menu_active = false;
-	bool menu_down = false;
-	if(session_state_ == XR_SESSION_STATE_FOCUSED && xrSyncActions(session_, &sync) == XR_SUCCESS)
-	{
+	const int previous = primary_hand_;
+	bool synced = session_state_ == XR_SESSION_STATE_FOCUSED && xrSyncActions(session_, &sync) == XR_SUCCESS;
+	for(int i = 0; i < 2; ++i) {
+		auto &hand = hands[i];
 		XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-		get.action = controller_select_;
-		get.subactionPath = controller_hand_;
-		XrActionStateBoolean select{XR_TYPE_ACTION_STATE_BOOLEAN};
-		select_active = XR_SUCCEEDED(xrGetActionStateBoolean(session_, &get, &select)) && select.isActive;
-		select_down = select_active && select.currentState;
-		get.action = controller_menu_;
-		XrActionStateBoolean menu{XR_TYPE_ACTION_STATE_BOOLEAN};
-		menu_active = XR_SUCCEEDED(xrGetActionStateBoolean(session_, &get, &menu)) && menu.isActive;
-		menu_down = menu_active && menu.currentState;
-
+		get.subactionPath = controller_hands_[i];
 		get.action = controller_aim_;
 		XrActionStatePose aim{XR_TYPE_ACTION_STATE_POSE};
-		XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-		constexpr XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
-				| XR_SPACE_LOCATION_POSITION_VALID_BIT;
-		if(XR_SUCCEEDED(xrGetActionStatePose(session_, &get, &aim)) && aim.isActive
-				&& XR_SUCCEEDED(xrLocateSpace(controller_space_, app_space_, display_time, &location))
-				&& (location.locationFlags & valid) == valid)
-		{
-			const XrVector3f &p = location.pose.position;
-			const XrVector3f d = RotateVector(location.pose.orientation, {0.0f, 0.0f, -1.0f});
-			sample.flags = tracked_bit | UpdateControllerRay(p.x, p.y, p.z, d.x, d.y, d.z,
-					select_down, &sample.u, &sample.v);
-		}
+		XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+		constexpr auto valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+		hand.tracked = synced && XR_SUCCEEDED(xrGetActionStatePose(session_, &get, &aim)) && aim.isActive
+				&& XR_SUCCEEDED(xrLocateSpace(controller_spaces_[i], app_space_, display_time, &loc))
+				&& (loc.locationFlags & valid) == valid;
+		hand.pose = loc.pose;
+		auto button = [&](XrAction action, bool &armed) {
+			get.action = action;
+			XrActionStateBoolean value{XR_TYPE_ACTION_STATE_BOOLEAN};
+			bool active_value = hand.tracked && XR_SUCCEEDED(xrGetActionStateBoolean(session_, &get, &value)) && value.isActive;
+			armed = active_value && (armed || !value.currentState);
+			return armed && bool(value.currentState);
+		};
+		hand.select = button(controller_select_, controller_armed_[i]);
+		hand.menu = button(controller_menu_, menu_armed_[i]);
 	}
-	if(!(sample.flags & tracked_bit))
-	{
+	auto pressed = [&](int i) { return hands[i].select || hands[i].menu; };
+	if(previous >= 0 && hands[previous].tracked && pressed(previous)) {
+		primary_hand_ = previous; // A held select owns its entire drag.
+	} else if(pressed(1) || pressed(0)) {
+		primary_hand_ = pressed(1) ? 1 : 0;
+	} else if(previous >= 0 && hands[previous].tracked) {
+		primary_hand_ = previous;
+	} else {
+		primary_hand_ = hands[1].tracked ? 1 : (hands[0].tracked ? 0 : -1);
+	}
+	if(primary_hand_ >= 0) {
+		const auto &hand = hands[primary_hand_];
+		controller_aim_valid_ = true;
+		controller_aim_pose_ = hand.pose;
+		const auto &p = hand.pose.position;
+		auto d = RotateVector(hand.pose.orientation, {0,0,-1});
+		float surface_distance = 0;
+		controller_ray_hit_ = UpdatePointerRay(0,p.x,p.y,p.z,d.x,d.y,d.z,hand.select,
+				&sample.u,&sample.v,true,&surface_distance);
+		controller_ray_length_ = surface_distance > 0 ? surface_distance : 1.25f;
+		sample.flags = tracked_bit | controller_ray_hit_ | (hand.select ? select_bit : 0) | (hand.menu ? menu_bit : 0);
+	} else {
 		cursor_visible_[0].store(false);
 		corner_hovered_.store(false);
 	}
-	// Require a release after gaining focus or regaining tracking.
-	controller_armed_ = (sample.flags & tracked_bit) && select_active && (controller_armed_ || !select_down);
-	menu_armed_ = menu_active && (menu_armed_ || !menu_down);
-	if(controller_armed_ && select_down)
-		sample.flags |= select_bit;
-	if(menu_armed_ && menu_down)
-		sample.flags |= menu_bit;
+	if(previous != primary_hand_)
+		LOGI("XR primary pointer %s: left tracked=%d select=%d menu=%d, right tracked=%d select=%d menu=%d",
+				primary_hand_ < 0 ? "none" : (primary_hand_ == 0 ? "left" : "right"),
+				hands[0].tracked,hands[0].select,hands[0].menu,hands[1].tracked,hands[1].select,hands[1].menu);
 
 	std::lock_guard<std::mutex> lock(controller_mutex_);
 	constexpr int transitions = tracked_bit | select_bit | menu_bit;
+	if(previous != primary_hand_ && (controller_latest_.flags & (select_bit | menu_bit)) != 0) {
+		auto released = controller_latest_;
+		released.flags &= ~(select_bit | menu_bit);
+		controller_changes_.push_back(released);
+		controller_latest_ = released;
+	}
 	if((sample.flags ^ controller_latest_.flags) & transitions)
 	{
 		if(controller_changes_.size() >= 32)
 		{
 			controller_changes_.clear();
 			controller_changes_.push_back({});
-			controller_armed_ = false;
-			menu_armed_ = false;
+			controller_armed_.fill(false);
+			menu_armed_.fill(false);
 			sample.flags &= ~(select_bit | menu_bit);
 		}
 		controller_changes_.push_back(sample);
@@ -2245,8 +2346,10 @@ int XrVideoSession::UpdateControllerRay(float ox, float oy, float oz, float dx, 
 	return UpdatePointerRay(0, ox, oy, oz, dx, dy, dz, buttons, outU, outV, true);
 }
 
-int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV, bool is_controller)
+int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, float dx, float dy, float dz,
+		int buttons, float *outU, float *outV, bool is_controller, float *surface_distance)
 {
+	if(surface_distance) *surface_distance = 0;
 	if(slot < 0 || slot > 1) slot = 0;
 	if(outU) *outU = 0.0f;
 	if(outV) *outV = 0.0f;
@@ -2320,6 +2423,7 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 				float v = 0.5f - (hy / set_h);
 				if(u >= -0.03f && u <= 1.03f && v >= -0.03f && v <= 1.03f)
 				{
+					if(surface_distance) *surface_distance = t;
 					float cdist = std::max(0.2f, t - 0.008f);
 					{
 						std::lock_guard<std::mutex> lock(cursor_mutex_);
@@ -2342,23 +2446,9 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 	// 1. Check intersection with HUD Quad when HUD is visible
 	if(hud_vis)
 	{
-		const float hud_dist = kFixedUiDist;
-		float hud_scale = hud_dist / 1.45f;
-		float half_v_angle = std::atan(std::tan(params.centralAngle * 0.5f) / std::max(0.2f, params.aspectRatio));
-		float height_angle = (params.radius > 0.1f) ? std::atan2(params.heightOffset, params.radius) : 0.0f;
-		float down_angle = std::clamp(half_v_angle + 0.08f, 0.22f, 0.55f);
-		float hud_pitch = total_pitch + height_angle - down_angle;
-		float cos_hp = std::cos(hud_pitch);
-		float sin_hp = std::sin(hud_pitch);
-		XrQuaternionf hud_ori = QuatFromYawPitch(total_yaw, hud_pitch);
-		XrVector3f hud_pos{
-			recenter_pos.x - std::sin(total_yaw) * cos_hp * hud_dist,
-			recenter_pos.y + sin_hp * hud_dist,
-			recenter_pos.z - std::cos(total_yaw) * cos_hp * hud_dist
-		};
-		float hud_w = kHudWidth1M * hud_scale;
-		float hud_h = hud_w * (float)kHudHeight / (float)kHudWidth;
-
+		const auto hud = GetHudGeometry(browser_mode_, total_yaw, total_pitch, params, recenter_pos);
+		const XrQuaternionf &hud_ori = hud.pose.orientation;
+		const XrVector3f &hud_pos = hud.pose.position;
 		XrVector3f p_hud = RotateByInverse(hud_ori, XrVector3f{ox - hud_pos.x, oy - hud_pos.y, oz - hud_pos.z});
 		XrVector3f d_hud = RotateByInverse(hud_ori, XrVector3f{dx, dy, dz});
 		if(d_hud.z < -0.02f)
@@ -2368,8 +2458,8 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 			{
 				float hx = p_hud.x + t * d_hud.x;
 				float hy = p_hud.y + t * d_hud.y;
-				float u = (hx / hud_w) + 0.5f;
-				float v = 0.5f - (hy / hud_h);
+				float u = (hx / hud.size.width) + 0.5f;
+				float v = 0.5f - (hy / hud.size.height);
 				if(u >= -0.02f && u <= 1.02f && v >= -0.02f && v <= 1.02f)
 				{
 					bool hit_opaque = false;
@@ -2398,6 +2488,7 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 					}
 					if(hit_opaque)
 					{
+						if(surface_distance) *surface_distance = t;
 						float cdist = std::max(0.2f, t - 0.008f);
 						{
 							std::lock_guard<std::mutex> lock(cursor_mutex_);
@@ -2459,6 +2550,7 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 					float v = 0.5f - (hy / std::max(0.05f, scr_h));
 					if(u >= -0.25f && u <= 1.25f && v >= -0.20f && v <= 1.85f)
 					{
+						if(surface_distance) *surface_distance = t;
 						float cdist = std::max(0.35f, t - 0.015f);
 						XrQuaternionf tangent_ori = QuatMul(scr_ori, QuatFromYawPitch(-theta, 0.0f));
 						{
@@ -2513,6 +2605,7 @@ int XrVideoSession::UpdatePointerRay(int slot, float ox, float oy, float oz, flo
 				if(u >= -0.25f && u <= 1.25f && v >= -0.20f && v <= 1.85f)
 				{
 					// Place cursor directly on the screen surface so there is zero stereo parallax
+					if(surface_distance) *surface_distance = t;
 					float cdist = std::max(0.35f, t - 0.015f);
 					{
 						std::lock_guard<std::mutex> lock(cursor_mutex_);
@@ -4558,6 +4651,7 @@ void XrVideoSession::FrameLoop()
 		RenderFrame();
 	}
 
+	controller_model_.Reset();
 	if(danmaku_clear_fbo_ != 0)
 	{
 		if(eglGetCurrentContext() != EGL_NO_CONTEXT)
@@ -4579,6 +4673,9 @@ void XrVideoSession::PollEvents()
 
 		switch(event.type)
 		{
+			case XR_TYPE_EVENT_DATA_INTERACTION_RENDER_MODELS_CHANGED_EXT:
+				controller_model_.ModelsChanged();
+				break;
 			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
 			{
 				const auto *changed = reinterpret_cast<const XrEventDataSessionStateChanged *>(&event);
@@ -4740,6 +4837,7 @@ void XrVideoSession::RenderFrame()
 
 	// Locate views and run OpenXR hand tracking BEFORE snapshotting screen pose so
 	// every composition layer reflects this frame's exact predicted hand motion (0-frame lag).
+	bool stereo_valid = false;
 	if(view_count_ > 0 && frame_state.shouldRender)
 	{
 		XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
@@ -4748,7 +4846,10 @@ void XrVideoSession::RenderFrame()
 		locate.space = app_space_;
 		XrViewState view_state{XR_TYPE_VIEW_STATE};
 		uint32_t located = 0;
-		xrLocateViews(session_, &locate, &view_state, view_count_, &located, views_.data());
+		constexpr XrViewStateFlags valid_views =
+				XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+		stereo_valid = XR_SUCCEEDED(xrLocateViews(session_, &locate, &view_state, view_count_, &located, views_.data()))
+				&& located == 2 && (view_state.viewStateFlags & valid_views) == valid_views;
 
 		if(located >= 2 && !logged_ipd_ &&
 				(view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT))
@@ -5540,80 +5641,57 @@ void XrVideoSession::RenderFrame()
 		}
 		float total_yaw = YawFromQuat(recenter) + params.yawOffset + frame_screen_yaw;
 		float total_pitch = PitchFromQuat(recenter) + frame_screen_pitch;
-		bool dm_is_quad = false;
-		bool dm_is_stereo = false;
-		if(UpdateDanmakuLayer(danmaku_cyl, danmaku_cyl_right, danmaku_quad, danmaku_quad_right, dm_is_quad, dm_is_stereo, total_yaw, total_pitch, params, dm_recenter_pos))
+		uint32_t quad_mask = 0;
+		bool stereo_cylinder = false;
+		if(UpdateDanmakuLayer(danmaku_cyl, danmaku_cyl_right, danmaku_quad, danmaku_quad_right,
+				quad_mask, stereo_cylinder, total_yaw, total_pitch, params, dm_recenter_pos))
 		{
-			if(image_layout_supported_)
+			const XrCompositionLayerBaseHeader *text_layers[2];
+			size_t text_count = 0;
+			auto append = [&](auto &layer, auto &layout, auto &settings) {
+				if(image_layout_supported_)
+				{
+					layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
+					layer.next = &layout;
+				}
+				if(layer_settings_supported_)
+				{
+					settings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
+					settings.next = const_cast<void *>(layer.next);
+					layer.next = &settings;
+				}
+				text_layers[text_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer);
+			};
+			if(quad_mask != 0)
 			{
-				danmaku_layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
-				if(dm_is_quad)
-				{
-					danmaku_quad.next = &danmaku_layout;
-					if(dm_is_stereo)
-					{
-						danmaku_layout_right.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
-						danmaku_quad_right.next = &danmaku_layout_right;
-					}
-				}
-				else
-				{
-					danmaku_cyl.next = &danmaku_layout;
-					if(dm_is_stereo)
-					{
-						danmaku_layout_right.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
-						danmaku_cyl_right.next = &danmaku_layout_right;
-					}
-				}
-			}
-			// Compositor hardware sharpening tightens scrolled glyphs without extra app GPU/CPU cost.
-			if(layer_settings_supported_)
-			{
-				danmaku_settings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
-				if(dm_is_quad)
-				{
-					danmaku_settings.next = const_cast<void *>(danmaku_quad.next);
-					danmaku_quad.next = &danmaku_settings;
-					if(dm_is_stereo)
-					{
-						danmaku_settings_right.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
-						danmaku_settings_right.next = const_cast<void *>(danmaku_quad_right.next);
-						danmaku_quad_right.next = &danmaku_settings_right;
-					}
-				}
-				else
-				{
-					danmaku_settings.next = const_cast<void *>(danmaku_cyl.next);
-					danmaku_cyl.next = &danmaku_settings;
-					if(dm_is_stereo)
-					{
-						danmaku_settings_right.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
-						danmaku_settings_right.next = const_cast<void *>(danmaku_cyl_right.next);
-						danmaku_cyl_right.next = &danmaku_settings_right;
-					}
-				}
-			}
-			const XrCompositionLayerBaseHeader *dm_layers[2];
-			size_t dm_count = 0;
-			if(dm_is_quad)
-			{
-				dm_layers[dm_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&danmaku_quad);
-				if(dm_is_stereo)
-					dm_layers[dm_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&danmaku_quad_right);
+				if(quad_mask & 1)
+					append(danmaku_quad, danmaku_layout, danmaku_settings);
+				if(quad_mask & 2)
+					append(danmaku_quad_right, danmaku_layout_right, danmaku_settings_right);
 			}
 			else
 			{
-				dm_layers[dm_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&danmaku_cyl);
-				if(dm_is_stereo)
-					dm_layers[dm_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&danmaku_cyl_right);
+				append(danmaku_cyl, danmaku_layout, danmaku_settings);
+				if(stereo_cylinder)
+					append(danmaku_cyl_right, danmaku_layout_right, danmaku_settings_right);
 			}
-			layers.insert(layers.begin() + danmaku_insert_idx, dm_layers, dm_layers + dm_count);
+			layers.insert(layers.begin() + danmaku_insert_idx, text_layers, text_layers + text_count);
 		}
 	}
 
-	if(frame_state.shouldRender)
-	{
-		// (The danmaku worker wake-up is signalled at the start of the frame now.)
+	if(stereo_valid && session_state_ == XR_SESSION_STATE_FOCUSED && controller_attached_
+			&& (model_extensions_ || controller_aim_valid_) && layers.size() < max_layer_count_) {
+		if(auto *pointer = controller_model_.Draw(vm_, instance_, session_, controller_hands_, app_space_,
+				frame_state.predictedDisplayTime, views_.data(), controller_aim_pose_,
+				controller_aim_valid_ ? controller_ray_length_ : 0, controller_ray_hit_, primary_hand_,
+				model_extensions_, pointer_eye_size_)) {
+			// Keep the existing cursor quads visible on top of the beam endpoint.
+			auto cursor = std::find_if(layers.begin(), layers.end(), [&](const auto *layer) {
+				return layer == reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor_layer_0)
+						|| layer == reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor_layer_1);
+			});
+			layers.insert(cursor, pointer);
+		}
 	}
 
 	XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
@@ -5751,8 +5829,9 @@ void XrVideoSession::Destroy()
 	danmaku_dirty_count_.store(0);
 	{
 		std::lock_guard<std::mutex> lock(danmaku_mutex_);
-		g_dm_slots[0].valid = false;
-		g_dm_slots[1].valid = false;
+		for(auto &slot : danmaku_slots_)
+			slot.upload.valid = false;
+		danmaku_upload_.valid = false;
 	}
 	g_dm_upload_h_hint.store(0);
 	if(cursor_swapchain_ != XR_NULL_HANDLE)
@@ -5783,9 +5862,11 @@ void XrVideoSession::Destroy()
 		}
 	}
 
-	if(controller_space_ != XR_NULL_HANDLE)
-		xrDestroySpace(controller_space_);
-	controller_space_ = XR_NULL_HANDLE;
+	for(auto &space : controller_spaces_) {
+		if(space != XR_NULL_HANDLE) xrDestroySpace(space);
+		space = XR_NULL_HANDLE;
+	}
+	primary_hand_ = -1;
 
 	if(app_space_ != XR_NULL_HANDLE)
 		xrDestroySpace(app_space_);

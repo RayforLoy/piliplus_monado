@@ -14,6 +14,7 @@
 #include <jni.h>
 #include "tone_mapper.h"
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <thread>
@@ -29,6 +30,7 @@
 #include <GLES3/gl3.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include "controller_model.h"
 
 #ifndef XR_META_hand_tracking_frequency_hint
 #define XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME "XR_META_hand_tracking_frequency_hint"
@@ -43,6 +45,13 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetHandTrackingFrequencyHintMETA)(
 #endif
 
 namespace p5m {
+
+struct CinemaTextBands
+{
+	int32_t danmaku_height = 0;
+	bool danmaku = false;
+	bool subtitle = false;
+};
 
 // Geometria da tela virtual. Os defaults valem uma tela grande e confortavel:
 // 4 m de raio, 70 graus de arco. Ajustavel em runtime pelo usuario.
@@ -441,10 +450,12 @@ public:
 	void SetOsdVisible(bool visible) { osd_visible_ = visible; }
 	void SetResBitmap(const uint8_t *pixels, int32_t width, int32_t height);
 	void SetResVisible(bool visible) { res_visible_ = visible; }
-	void SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height, size_t source_stride);
+	void SetDanmakuBitmap(const uint8_t *pixels, int32_t width, int32_t height, size_t source_stride,
+			CinemaTextBands bands = {});
 	void SetDanmakuVisible(bool visible) { danmaku_visible_ = visible; }
 	int UpdateControllerRay(float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV);
-	int UpdatePointerRay(int slot, float ox, float oy, float oz, float dx, float dy, float dz, int buttons, float *outU, float *outV, bool is_controller = true);
+	int UpdatePointerRay(int slot, float ox, float oy, float oz, float dx, float dy, float dz, int buttons,
+			float *outU, float *outV, bool is_controller = true, float *surface_distance = nullptr);
 	void PollHandTracking(float outState[26]);
 	void SetHandTrackingEnabled(bool enabled);
 	void SetHandCursorHidden(bool hidden);
@@ -483,11 +494,18 @@ private:
 	XrAction controller_aim_ = XR_NULL_HANDLE;
 	XrAction controller_select_ = XR_NULL_HANDLE;
 	XrAction controller_menu_ = XR_NULL_HANDLE;
-	XrSpace controller_space_ = XR_NULL_HANDLE;
-	XrPath controller_hand_ = XR_NULL_PATH;
+	std::array<XrSpace, 2> controller_spaces_{};
+	int primary_hand_ = -1;
+	ControllerModelLayer controller_model_;
+	bool model_extensions_ = false;
+	bool controller_aim_valid_ = false;
+	XrPosef controller_aim_pose_{};
+	float controller_ray_length_ = 0;
+	int controller_ray_hit_ = 0;
+	uint32_t max_layer_count_ = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
+	std::array<XrPath, 2> controller_hands_{};
 	bool controller_attached_ = false;
-	bool controller_armed_ = false;
-	bool menu_armed_ = false;
+	std::array<bool, 2> controller_armed_{}, menu_armed_{};
 	bool browser_mode_ = false;
 	bool monado_runtime_ = false;
 	std::mutex controller_mutex_;
@@ -518,7 +536,10 @@ private:
 	bool UpdateOsdLayer(XrCompositionLayerQuad &layer, float yaw, float pitch, const ScreenParams &params, const XrVector3f &recenter_pos);
 	bool InitResSwapchain();
 	bool UpdateResLayer(XrCompositionLayerQuad &layer, float yaw, float pitch, const ScreenParams &params, const XrVector3f &recenter_pos);
-	bool UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCompositionLayerCylinderKHR &cyl_right, XrCompositionLayerQuad &quad, XrCompositionLayerQuad &quad_right, bool &out_is_quad, bool &out_is_stereo, float yaw, float pitch, const ScreenParams &params, const XrVector3f &recenter_pos);
+	bool UpdateDanmakuLayer(XrCompositionLayerCylinderKHR &cyl, XrCompositionLayerCylinderKHR &cyl_right,
+			XrCompositionLayerQuad &quad, XrCompositionLayerQuad &quad_right, uint32_t &out_quad_mask,
+			bool &out_stereo_cylinder, float yaw, float pitch, const ScreenParams &params,
+			const XrVector3f &recenter_pos);
 	bool UpdateCursorLayer(XrCompositionLayerQuad &layer, int slot = 0);
 	bool UpdateCornerLayer(XrCompositionLayerQuad &layer);
 	void UpdateHandTracking(XrTime display_time);
@@ -686,6 +707,7 @@ private:
 	// desenha nada, mas o runtime espera esse handshake e ha implementacoes que
 	// so inicializam estado interno de view quando ele acontece.
 	uint32_t view_count_ = 0;
+	XrExtent2Di pointer_eye_size_{1024,1024};
 	std::vector<XrView> views_;
 
 	std::mutex params_mutex_;
@@ -773,13 +795,30 @@ private:
 	bool danmaku_right_swapchain_acquired_ = false;
 	uint32_t danmaku_right_acquired_idx_ = 0;
 	std::atomic<bool> danmaku_right_has_image_{false};
+	CinemaTextBands danmaku_displayed_bands_;
 	int32_t danmaku_width_ = 0;
 	int32_t danmaku_height_ = 0;
+	struct DanmakuUpload
+	{
+		std::vector<uint8_t> pixels;
+		int32_t width = 0;
+		int32_t height = 0;
+		int32_t copy_height = 0;
+		CinemaTextBands bands;
+		bool stereo = false;
+		bool valid = false;
+	};
+	struct DanmakuSlot
+	{
+		DanmakuUpload upload;
+		uint64_t frame = 0;
+	};
+	DanmakuSlot danmaku_slots_[2];
+	DanmakuUpload danmaku_upload_;
 	std::mutex danmaku_mutex_;
 	std::mutex danmaku_write_mutex_;
 	std::vector<uint8_t> danmaku_pixels_;
 	std::vector<uint8_t> danmaku_staging_pixels_;
-	std::vector<uint8_t> danmaku_upload_pixels_;
 	std::atomic<bool> danmaku_visible_{false};
 	std::atomic<int> danmaku_dirty_count_{0};
 	std::atomic<bool> danmaku_has_image_{false};

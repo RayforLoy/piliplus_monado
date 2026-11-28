@@ -73,6 +73,13 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private Surface vrSurface;
     private long vrWid = 0;
     private long currentMpvHandle = 0;
+    private static final String AUDIO_OUTPUT_OPTION = "options/ao";
+    private static final String PILIPLUS_DEFAULT_AUDIO = "opensles,aaudio,audiotrack";
+    private static final String CINEMA_DEFAULT_AUDIO = "audiotrack,aaudio,opensles";
+    private long cinemaAudioOverrideHandle;
+    private String lastAudioOutput;
+    private long hiddenSubtitleHandle;
+    private long lastSubtitleRouteCheckAt;
     private Handler handler;
     private volatile boolean isRunning = false;
     private volatile boolean initializing = false;
@@ -243,7 +250,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     // picture. We detect "no new frame on the VR texture" and take the wid back.
     private final AtomicInteger frameCount = new AtomicInteger(0);
     private volatile long lastFrameAt = 0;
-    private volatile long lastWidAssertAt = 0;
+    private long lastWidCheckAt;
     private volatile int widAssertCount = 0;
     private long lastStatsAt = 0;
     private int lastStatsFrames = 0;
@@ -455,12 +462,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
 
             // 1. Set RenderPath 1 (ToneMapper pipeline via SurfaceTexture)
             xr.setRenderPath(1, false);
-            curtainDurationMs = ZipDepthSource.isModelCached(getCacheDir()) ? CURTAIN_MS_CACHED : CURTAIN_MS_COLD;
-            try {
-                AiDepthNative.setCurtainDuration((int) curtainDurationMs);
-            } catch (Throwable t) {
-                Log.w(TAG, "curtain duration JNI failed", t);
-            }
+            simpleController = Cv10Input.usesSimpleController(xr.getNativeHandle());
+            configureCurtain(ZipDepthSource.isModelCached(getCacheDir()));
             // The JNI session exists from xr.create(); restore the saved debug
             // view before the first frame is drawn.
             syncShowDepth();
@@ -496,7 +499,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                 public void onFrameAvailable(SurfaceTexture st) {
                     frameCount.incrementAndGet();
                     lastFrameAt = SystemClock.uptimeMillis();
-                    if (!curtainStarted) startCurtainFreeze();
+                    if (curtainDurationMs > 0 && !curtainStarted) startCurtainFreeze();
                 }
             }, handler);
             boolean attached = xr.attachSurfaceTexture(vrTexture);
@@ -515,7 +518,6 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             alignPanelRate();
             xr.setVideoLayerEnabled(true);
 
-            simpleController = Cv10Input.usesSimpleController(xr.getNativeHandle());
             if (!simpleController) touchActive = TouchInput.attach(xr.getNativeHandle());
 
             xr.start();
@@ -531,12 +533,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                     effectiveDanmakuDensityIdx(), danmakuSpanIdx);
             danmakuEngine.setDanmakuParams(danmakuDistIdx, danmakuSpanIdx, danmakuVOut);
             applyPortraitDanmakuVOutDefault(videoW, videoH);
-            // No danmaku (or CC overlay) until the intro curtain has fully
-            // parted. The reveal callback restores it, unless the AI resource
-            // policy wants it suspended anyway.
-            curtainDanmakuHidden = true;
+            curtainDanmakuHidden = curtainDurationMs > 0;
             refreshDanmakuSuspension();
-            Log.i(TAG, "Intro curtain: overlay hidden until reveal");
             reloadQualitiesTsv(true);
             pollHudState(SystemClock.uptimeMillis(), true);
 
@@ -613,6 +611,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         stopZipDepth();
 
         if (restoreFlutterFirst) releaseMpvToFlutterSoft();
+        restoreCinemaAudio(VrState.mpvHandle);
 
         if (danmakuEngine != null) {
             try { danmakuEngine.stop(); } catch (Throwable ignored) {}
@@ -653,7 +652,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
 
         currentMpvHandle = 0;
         lastFrameAt = 0;
-        lastWidAssertAt = 0;
+        lastWidCheckAt = 0;
+        lastSubtitleRouteCheckAt = 0;
         lastRequestedPanelHz = 0;
         panelRate = 0f;
         lastJavaManipulating = false;
@@ -832,6 +832,16 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         }
     }
 
+    private void configureCurtain(boolean depthModelCached) {
+        // CV10 starts playback directly so the intro cannot stop and restart the USB audio stream.
+        curtainDurationMs = simpleController ? 0L : (depthModelCached ? CURTAIN_MS_CACHED : CURTAIN_MS_COLD);
+        try {
+            AiDepthNative.setCurtainDuration((int) curtainDurationMs);
+        } catch (Throwable t) {
+            Log.w(TAG, "curtain duration JNI failed", t);
+        }
+    }
+
     /** Freeze the very first decoded frame; the native curtain starts on the
      *  same frame. Playback resumes only after the panels fully part. */
     private void startCurtainFreeze() {
@@ -872,7 +882,6 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                             MpvBridge.setProp(h, "pause", "no");
                             resumeGuardUntil = SystemClock.uptimeMillis() + 3000L;
                             lastResumeNudgeAt = SystemClock.uptimeMillis();
-                            resumeMpv("curtain reveal");
                             isPaused = false;
                         }
                     }
@@ -903,6 +912,10 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                 vrWid = MpvBridge.newGlobalRef(vrSurface);
             }
             if (vrWid != 0) {
+                if (currentMpvHandle != handle) {
+                    lastAudioOutput = null;
+                    preferCinemaAudioTrack(handle);
+                }
                 currentMpvHandle = handle;
                 Log.i(TAG, "Redirecting mpv to OpenXR vrSurface (SurfaceTexture), wid=0x" + Long.toHexString(vrWid) + ", handle=0x" + Long.toHexString(handle));
 
@@ -916,13 +929,12 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                 //    steal the output right after we set it. mpv redraws the current frame
                 //    on VO re-creation anyway.
                 lastFrameAt = SystemClock.uptimeMillis();
-                lastWidAssertAt = lastFrameAt;
+                lastWidCheckAt = lastFrameAt;
                 userExplicitlyPaused = false;
                 isPaused = false;
                 // Let mpv paint the first frame onto the new VO. The freeze
                 // starts from onFrameAvailable(), so the curtain and the
                 // frozen frame are guaranteed to exist together.
-                MpvBridge.setProp(handle, "pause", "no");
                 resumeGuardUntil = lastFrameAt + 7000L;
                 lastResumeNudgeAt = lastFrameAt;
                 resumeMpv("VR attach");
@@ -931,6 +943,37 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             }
         } catch (Throwable t) {
             Log.e(TAG, "attachMpvToVrSurface error", t);
+        }
+    }
+
+    private void preferCinemaAudioTrack(long handle) {
+        if (!simpleController || cinemaAudioOverrideHandle == handle) return;
+        cinemaAudioOverrideHandle = 0;
+        try {
+            if (!PILIPLUS_DEFAULT_AUDIO.equals(MpvBridge.getProp(handle, AUDIO_OUTPUT_OPTION))) return;
+            int result = MpvBridge.setProp(handle, AUDIO_OUTPUT_OPTION, CINEMA_DEFAULT_AUDIO);
+            if (result >= 0) {
+                cinemaAudioOverrideHandle = handle;
+                Log.i(TAG, "Cinema audio requested=" + CINEMA_DEFAULT_AUDIO);
+            } else {
+                Log.w(TAG, "Cinema audio option failed, result=" + result);
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not configure cinema audio", e);
+        }
+    }
+
+    private void restoreCinemaAudio(long handle) {
+        long overriddenHandle = cinemaAudioOverrideHandle;
+        cinemaAudioOverrideHandle = 0;
+        if (handle == 0 || handle != overriddenHandle || handle != VrState.mpvHandle) return;
+        try {
+            if (CINEMA_DEFAULT_AUDIO.equals(MpvBridge.getProp(handle, AUDIO_OUTPUT_OPTION))) {
+                int result = MpvBridge.setProp(handle, AUDIO_OUTPUT_OPTION, PILIPLUS_DEFAULT_AUDIO);
+                if (result < 0) Log.w(TAG, "Could not restore the original audio option, result=" + result);
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not restore the original audio option", e);
         }
     }
 
@@ -950,6 +993,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         if (xr != null) {
             try { xr.stop(); } catch (Throwable ignored) {}
         }
+        restoreNativeTextSubtitles(VrState.mpvHandle);
         // Nothing to hand back if onPause already tore the VR surface down.
         if (vrWid == 0 && vrSurface == null) return;
         long handle = VrState.mpvHandle;
@@ -981,7 +1025,6 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                 VrState.stopOrphanedOrPauseOnVrExit(handle, isPaused);
             }
         }
-
         if (vrWid != 0) {
             try {
                 MpvBridge.deleteGlobalRef(vrWid);
@@ -1125,6 +1168,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                     isLimit4k(),
                     screenCurveIdx,
                     screenPitchPresetIdx,
+                    Math.round(screenFov / DEFAULT_FOV * 100f),
+                    fmtDist(screenDist),
                     danmakuDistIdx,
                     danmakuSpanIdx,
                     danmakuVOut,
@@ -1710,20 +1755,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     }
 
     private void pollHudState(long now, boolean force) {
-        if (!force && !isHudVisible) {
-            if (!userExplicitlyPaused && now < resumeGuardUntil) {
-                long handle = VrState.mpvHandle;
-                if (handle != 0) {
-                    try {
-                        if ("yes".equalsIgnoreCase(MpvBridge.getProp(handle, "pause"))) {
-                            MpvBridge.setProp(handle, "pause", "no");
-                            isPaused = false;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-            return;
-        }
+        if (!force && !isHudVisible) return;
         if (!force && (now - lastHudPollMs < 950L)) return;
         lastHudPollMs = now;
         final boolean liveSession = applyLiveTitle(now);
@@ -1750,19 +1782,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
                     // Intro curtain: intentionally frozen first frame. Show the user's
                     // intended post-curtain pause state and do not unfreeze early.
                     isPaused = userExplicitlyPaused;
-                } else if (userExplicitlyPaused) {
-                    isPaused = "yes".equalsIgnoreCase(p);
                 } else {
-                    if ("yes".equalsIgnoreCase(p)) {
-                        if (now < resumeGuardUntil) {
-                            MpvBridge.setProp(handle, "pause", "no");
-                            isPaused = false;
-                        } else {
-                            isPaused = true;
-                        }
-                    } else {
-                        isPaused = false;
-                    }
+                    isPaused = "yes".equalsIgnoreCase(p);
                 }
                 String m = MpvBridge.getProp(handle, "mute");
                 isMuted = "yes".equalsIgnoreCase(m);
@@ -1983,13 +2004,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             zipDepthDelayRunnable = null;
         }
         final boolean cached = ZipDepthSource.isModelCached(getCacheDir());
-        curtainDurationMs = cached ? CURTAIN_MS_CACHED : CURTAIN_MS_COLD;
-        // native uses the SAME value; set it before the first rendered frame.
-        try {
-            AiDepthNative.setCurtainDuration((int) curtainDurationMs);
-        } catch (Throwable t) {
-            Log.w(TAG, "curtain duration JNI failed", t);
-        }
+        configureCurtain(cached);
         applyAiEdgeEnhance();
         Log.i(TAG, "Intro curtain duration " + curtainDurationMs
                 + " ms (model cached=" + cached + ")");
@@ -2208,6 +2223,20 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         return d < 1.0f
                 ? String.format(Locale.ENGLISH, "%.2f", d)
                 : String.format(Locale.ENGLISH, "%.1f", d);
+    }
+
+    void adjustScreenFromSettings(boolean size, int direction) {
+        if (projectionMode != 0) return;
+        if (size) {
+            screenFov = direction == 0 ? DEFAULT_FOV
+                    : clamp(screenFov * (direction < 0 ? 1f / 1.1f : 1.1f), MIN_FOV, MAX_FOV);
+        } else {
+            screenDist = direction == 0 ? DEFAULT_DIST
+                    : clamp(screenDist * (direction < 0 ? 1f / 1.2f : 1.2f), MIN_DIST, MAX_DIST);
+        }
+        applyScreenParams();
+        saveScreenPrefs();
+        Log.i(TAG, "Cinema geometry: fov=" + screenFov + " rad, distance=" + screenDist + " m");
     }
 
     /**
@@ -2597,6 +2626,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         try {
             if ("yes".equalsIgnoreCase(MpvBridge.getProp(handle, "pause"))) {
                 MpvBridge.setProp(handle, "pause", "no");
+                isPaused = false;
                 Log.i(TAG, "Resumed mpv (" + why + ")");
             }
         } catch (Throwable t) {
@@ -2755,6 +2785,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
     private void releaseMpvToFlutterSoft() {
         try {
             long handle = VrState.mpvHandle;
+            restoreNativeTextSubtitles(handle);
             if (handle != 0) {
                 if (VrState.engineDetached) {
                     VrState.stopOrphanedOrPauseOnVrExit(handle, isPaused);
@@ -2866,6 +2897,7 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             maybeAdaptToVideoSize(now);
         }
         pollHudState(now, false);
+        updateNativeSubtitleRoute(now);
         brightnessWatchdog(now);
         mpvOutputWatchdog(now);
         playResumeGuard(now);
@@ -2939,7 +2971,8 @@ public final class VrPlayerActivity extends Activity implements Runnable {
      * media_kit Dart side re-applies mpv's "wid" to the Flutter SurfaceTexture on every
      * videoParams change (and during initial load). After that, mpv keeps rendering into
      * the invisible 2D texture: audio continues, but the VR layer shows a stale frame.
-     * Detect a stalled frame flow on our texture and re-point mpv to vrSurface.
+     * Recover only when the Surface target changed. A cache stall can hold
+     * the last picture while the player still owns the correct Surface.
      */
     private void mpvOutputWatchdog(long now) {
         if (vrWid == 0 || vrSurface == null || !vrSurface.isValid() || xr == null) return;
@@ -2949,11 +2982,12 @@ public final class VrPlayerActivity extends Activity implements Runnable {
 
         // Frames are flowing, nothing to do.
         if (lastFrameAt != 0 && now - lastFrameAt < 900) return;
-        // Rate-limit: each re-assert re-creates mpv's VO, so don't thrash.
-        if (now - lastWidAssertAt < 1600) return;
+        if (now - lastWidCheckAt < 1600) return;
+        lastWidCheckAt = now;
 
         try {
             if ("yes".equalsIgnoreCase(MpvBridge.getProp(handle, "pause"))) return;
+            if ("yes".equalsIgnoreCase(MpvBridge.getProp(handle, "paused-for-cache"))) return;
             if ("yes".equalsIgnoreCase(MpvBridge.getProp(handle, "eof-reached"))) return;
             // Only act once the video has real parameters; otherwise we would fight the
             // player while it is still opening the file.
@@ -2964,9 +2998,15 @@ public final class VrPlayerActivity extends Activity implements Runnable {
             }
             if (vw <= 0) return;
 
-            lastWidAssertAt = now;
+            String wanted = String.valueOf(vrWid);
+            String actual = MpvBridge.getProp(handle, "wid");
+            if (actual == null || wanted.equals(actual.trim())) return;
+            int r = MpvBridge.setProp(handle, "wid", wanted);
+            if (r < 0) {
+                Log.w(TAG, "Could not restore mpv Surface, result=" + r);
+                return;
+            }
             widAssertCount++;
-            int r = MpvBridge.setProp(handle, "wid", String.valueOf(vrWid));
             MpvBridge.setProp(handle, "android-surface-size", renderWidth + "x" + renderHeight);
             Log.w(TAG, "Watchdog: no new frames for " + (now - lastFrameAt) + "ms, re-asserted mpv wid=0x"
                     + Long.toHexString(vrWid) + " result=" + r + " (attempt " + widAssertCount + ")");
@@ -2975,8 +3015,52 @@ public final class VrPlayerActivity extends Activity implements Runnable {
         }
     }
 
+    private void updateNativeSubtitleRoute(long now) {
+        if (now - lastSubtitleRouteCheckAt < 800L) return;
+        lastSubtitleRouteCheckAt = now;
+        long handle = VrState.mpvHandle;
+        if (handle == 0 || handle != currentMpvHandle) return;
+        try {
+            if (hiddenSubtitleHandle != handle) hiddenSubtitleHandle = 0;
+            String codec = MpvBridge.getProp(handle, "current-tracks/sub/codec");
+            boolean text = "webvtt".equals(codec) || "subrip".equals(codec) || "ass".equals(codec)
+                    || "ssa".equals(codec) || "mov_text".equals(codec) || "text".equals(codec);
+            if (!text) {
+                restoreNativeTextSubtitles(handle);
+            } else if (hiddenSubtitleHandle == 0
+                    && "yes".equals(MpvBridge.getProp(handle, "sub-visibility"))
+                    && MpvBridge.setProp(handle, "sub-visibility", "no") >= 0) {
+                // Keep the track selected for sub-text. The XR text layer draws it.
+                hiddenSubtitleHandle = handle;
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not route mpv subtitles", e);
+        }
+    }
+
+    private void restoreNativeTextSubtitles(long handle) {
+        if (handle != 0 && hiddenSubtitleHandle == handle) {
+            MpvBridge.setProp(handle, "sub-visibility", "yes");
+        }
+        hiddenSubtitleHandle = 0;
+    }
+
     private void logFrameStats(long now) {
         if (now - lastStatsAt < 3000) return;
+        long handle = VrState.mpvHandle;
+        if (handle != 0 && handle == currentMpvHandle) {
+            try {
+                String output = MpvBridge.getProp(handle, "current-ao");
+                if (output != null && !output.equals(lastAudioOutput)) {
+                    lastAudioOutput = output;
+                    Log.i(TAG, "mpv audio output=" + output + " rate="
+                            + MpvBridge.getProp(handle, "audio-out-params/samplerate") + " format="
+                            + MpvBridge.getProp(handle, "audio-out-params/format"));
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not read the active mpv audio output", e);
+            }
+        }
         int total = frameCount.get();
         float scale = 1000000f;
         Log.i(TAG, "VR stats: frames/3s=" + (total - lastStatsFrames) + " total=" + total

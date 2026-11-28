@@ -37,6 +37,7 @@
     .line 3
     .line 4
     invoke-super {p0, p1}, Landroid/app/Activity;->onConfigurationChanged(Landroid/content/res/Configuration;)V
+    invoke-static {p0}, Lcom/example/piliplus/vr/Cv10Browser;->onHostConfigurationChanged(Landroid/app/Activity;)V
 
     .line 5
     .line 6
@@ -68,8 +69,6 @@
 
 .method public onCreate(Landroid/os/Bundle;)V
     .locals 3
-
-    invoke-static {p0}, Lcom/example/piliplus/vr/VrState;->ensureLandscapeSettings(Landroid/app/Activity;)V
 
     .line 1
     invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
@@ -111,9 +110,6 @@
     .line 20
     .line 21
     :cond_0
-    const/4 v0, 0x0
-    invoke-super {p0, v0}, Landroid/app/Activity;->setRequestedOrientation(I)V
-
     sput-object p0, Lcom/example/piliplus/vr/VrState;->main2DActivity:Landroid/app/Activity;
     invoke-static {p0}, Lcom/example/piliplus/vr/VrModeButton;->install(Landroid/app/Activity;)V
 
@@ -123,7 +119,8 @@
 .method public setRequestedOrientation(I)V
     .locals 1
 
-    const/4 v0, 0x0
+    # Keep the phone control surface upright when Flutter requests fullscreen.
+    const/4 v0, 0x1
 
     invoke-super {p0, v0}, Landroid/app/Activity;->setRequestedOrientation(I)V
 
@@ -140,6 +137,16 @@
     move-result p0
 
     return p0
+.end method
+
+.method public onWindowAttributesChanged(Landroid/view/WindowManager$LayoutParams;)V
+    .locals 0
+
+    invoke-static {p0, p1}, Lcom/example/piliplus/vr/BrowserPrimaryRate;->onWindowAttributesChanged(Landroid/app/Activity;Landroid/view/WindowManager$LayoutParams;)V
+
+    invoke-super {p0, p1}, Lv8;->onWindowAttributesChanged(Landroid/view/WindowManager$LayoutParams;)V
+
+    return-void
 .end method
 
 .method public onResume()V

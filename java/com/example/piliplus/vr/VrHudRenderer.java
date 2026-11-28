@@ -110,8 +110,9 @@ public final class VrHudRenderer {
     private static final float ROW_X1 = 984f;
     private static final float ROW_GAP = 10f;
 
-    private static final float TAB0_Y0 = 108f;
-    private static final float TAB0_STEP = 68f;
+    private static final float TAB0_Y0 = 101f;
+    private static final float TAB0_STEP = 49f;
+    private static final float TAB0_ROW_HEIGHT = 40f;
     private static final float TAB1_Y0 = 104f;
     private static final float TAB1_STEP = 56f;
     private static final float TAB2_Y0 = 132f;
@@ -670,6 +671,8 @@ public final class VrHudRenderer {
             boolean limit4k,
             int screenCurveIdx,
             int screenPitchIdx,
+            int screenSizePercent,
+            String screenDistanceMetres,
             int danmakuDistIdx,
             int danmakuSpanIdx,
             boolean danmakuVOut,
@@ -736,9 +739,19 @@ public final class VrHudRenderer {
 
         // --- 2. Tab Contents ---
         if (settingsTab == 0) {
+            int firstVideoRow = projModeIdx == 0 ? 2 : 0;
+            if (firstVideoRow == 2) {
+                drawRowLabel(c, "画面尺寸", SET_INNER_L, TAB0_Y0);
+                drawRowPills(c, TAB0_Y0, new String[]{"缩小", screenSizePercent + "% · 复位", "放大"},
+                        -1, TAB0_ROW_HEIGHT, 11.5f);
+                drawRowLabel(c, "观看距离", SET_INNER_L, TAB0_Y0 + TAB0_STEP);
+                drawRowPills(c, TAB0_Y0 + TAB0_STEP,
+                        new String[]{"拉近", screenDistanceMetres + " m · 复位", "推远"},
+                        -1, TAB0_ROW_HEIGHT, 11.5f);
+            }
             String[] rowLabels = {"\u89c6\u9891\u5206\u8fa8\u7387", "\u5206\u8fa8\u7387\u9650\u5236", "\u753b\u9762\u66f2\u7387", "\u753b\u9762\u4fef\u4ef0", "\u8fdb\u5165\u80cc\u666f"};
             for (int r = 0; r < 5; r++) {
-                float cy = TAB0_Y0 + r * TAB0_STEP;
+                float cy = TAB0_Y0 + (r + firstVideoRow) * TAB0_STEP;
                 drawRowLabel(c, rowLabels[r], SET_INNER_L, cy);
                 if (r == 0) {
                     int count = (qualities != null) ? Math.min(6, qualities.size()) : 0;
@@ -969,9 +982,18 @@ public final class VrHudRenderer {
         int currentTab = activity.getSettingsTab();
         if (currentTab == 0) {
             int row = Math.round((py - TAB0_Y0) / TAB0_STEP);
-            if (row < 0 || row >= 5 || Math.abs(py - (TAB0_Y0 + row * TAB0_STEP)) > 26f) {
+            int firstVideoRow = activity.getProjModeIdx() == 0 ? 2 : 0;
+            if (row < 0 || row >= firstVideoRow + 5
+                    || Math.abs(py - (TAB0_Y0 + row * TAB0_STEP)) > TAB0_ROW_HEIGHT / 2f) {
                 return false;
             }
+            if (row < firstVideoRow) {
+                int action = pickRowPill(px, 3);
+                if (action < 0) return false;
+                activity.adjustScreenFromSettings(row == 0, action - 1);
+                return true;
+            }
+            row -= firstVideoRow;
             int idx;
             if (row == 0) {
                 int count = (qualities != null) ? Math.min(6, qualities.size()) : 0;

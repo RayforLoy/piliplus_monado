@@ -735,7 +735,7 @@ GLuint CompileShader(GLenum type, const char *source)
 
 void SetCurtainDurationMs(int32_t ms)
 {
-	g_curtain_duration_ms.store(std::clamp(ms, 200, 10000), std::memory_order_release);
+	g_curtain_duration_ms.store(ms == 0 ? 0 : std::clamp(ms, 200, 10000), std::memory_order_release);
 }
 
 int32_t CurtainDurationMs()
@@ -2057,11 +2057,12 @@ void ToneMapper::UploadCommonUniforms(int32_t eyeWidth, int32_t eyeHeight, bool 
 	glUseProgram(program_);
 	{
 		float curtainOpen = 1.0f;
-		if(curtain_started_)
+		const int32_t curtainMs = CurtainDurationMs();
+		if(curtain_started_ && curtainMs > 0)
 		{
 			const auto now = std::chrono::steady_clock::now();
 			float ms = std::chrono::duration<float, std::milli>(now - curtain_start_).count();
-			float t = std::clamp(ms / (float)CurtainDurationMs(), 0.0f, 1.0f);
+			float t = std::clamp(ms / (float)curtainMs, 0.0f, 1.0f);
 			float e = t * t;
 			float tail = std::clamp((t - 0.88f) / 0.12f, 0.0f, 1.0f);
 			tail = tail * tail * (3.0f - 2.0f * tail);

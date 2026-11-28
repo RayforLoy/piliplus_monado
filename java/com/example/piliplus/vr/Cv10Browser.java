@@ -23,6 +23,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
+import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import io.github.gblandro.p5m.XrBridge;
@@ -34,11 +35,17 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
     }
 
     private static final String TAG = "PiliVrBrowser";
+    private static final int VIEWPORT_WIDTH_DP = 640;
+    private static final int MAX_RENDER_WIDTH = 1920;
+    private static final float VIEWPORT_ASPECT = 4f / 3f;
     private static final int HUD_WIDTH = 1024;
     private static final int HUD_HEIGHT = 640;
+    private static final int TOOLBAR_HEIGHT = 76;
+    private static final int KEY_ROW_HEIGHT = 70;
     private static final String[] TOOLBAR = {"返回", "上翻", "下翻", "键盘", "回正", "退出"};
     private static final String[] LETTERS = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm-_.@"};
     private static final String[] EDIT_KEYS = {"大小写", "空格", "删除", "提交"};
+    private static final int EDIT_ROW_TOP = TOOLBAR_HEIGHT + KEY_ROW_HEIGHT * LETTERS.length;
     private static volatile Cv10Browser active;
 
     private final Activity activity;
@@ -48,10 +55,12 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Cv10Input input = new Cv10Input();
     private final TextView phoneScreen;
+    private final ViewGroup.LayoutParams phoneLayout;
     private final Bitmap hud = Bitmap.createBitmap(HUD_WIDTH, HUD_HEIGHT, Bitmap.Config.ARGB_8888);
     private XrBridge xr;
     private SurfaceTexture texture;
     private Surface surface;
+    private FrameLayout.LayoutParams headsetLayout;
     private volatile boolean routed;
     private boolean keyboard;
     private boolean upperCase;
@@ -59,14 +68,19 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
     private boolean presenting;
     private long startedAt;
     private long touchDownTime;
+    private boolean dragging;
+    private float pressX;
+    private float pressY;
     private float touchX;
     private float touchY;
+    private float touchSlopSquared;
     private int width;
     private int height;
 
     private Cv10Browser(Activity activity, View flutter, SurfaceView surfaceView) {
         this.activity = activity;
         this.flutter = flutter;
+        phoneLayout = flutter.getLayoutParams();
         holder = surfaceView.getHolder();
         target = (SurfaceTarget) activity;
         phoneScreen = new TextView(activity);
@@ -78,6 +92,7 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         phoneScreen.setOnTouchListener((view, event) -> true);
         ViewGroup root = activity.findViewById(android.R.id.content);
         root.addView(phoneScreen, new ViewGroup.LayoutParams(-1, -1));
+        applyHeadsetViewport();
         activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         holder.addCallback(this);
     }
@@ -94,6 +109,10 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         if (active == null || active.activity != activity) return;
         active.close();
         active = null;
+    }
+
+    public static void onHostConfigurationChanged(Activity activity) {
+        if (active != null && active.activity == activity) active.applyHeadsetViewport();
     }
 
     static boolean isBrowsing(Activity activity) {
@@ -126,6 +145,25 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         stopSession();
     }
 
+    private static int viewportWidthPixels(float density) {
+        // Multiples of eight keep both axes even with an exact 4:3 ratio.
+        return 8 * Math.max(1, Math.round(VIEWPORT_WIDTH_DP * density / 8f));
+    }
+
+    private void applyHeadsetViewport() {
+        // Flutter sends the measured view size to the engine. Size this child
+        // independently while the phone status/controls keep the window size.
+        float density = flutter.getResources().getDisplayMetrics().density;
+        float slop = Math.max(ViewConfiguration.get(activity).getScaledTouchSlop(),
+                VrState.CONTROLLER_TAP_SLOP_DP * density);
+        touchSlopSquared = slop * slop;
+        int targetWidth = viewportWidthPixels(density);
+        if (headsetLayout != null && headsetLayout.width == targetWidth) return;
+        headsetLayout = new FrameLayout.LayoutParams(targetWidth, targetWidth / 4 * 3,
+                Gravity.TOP | Gravity.START);
+        flutter.setLayoutParams(headsetLayout);
+    }
+
     private void startSession() {
         width = flutter.getWidth();
         height = flutter.getHeight();
@@ -137,14 +175,14 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
             throw new IllegalStateException("Monado OpenXR session or Simple Controller bindings unavailable");
         }
 
-        final float aspect = (float) width / height;
-        final float scale = Math.min(1f, 1920f / Math.max(width, height));
+        final int renderWidth = Math.min(MAX_RENDER_WIDTH, width);
+        final int renderHeight = renderWidth / 4 * 3;
+        final float horizontalFov = (float) (2 * Math.atan(VIEWPORT_ASPECT * Math.tan(0.34)));
         xr.setRenderPath(1, false);
         xr.setLayerShape(1);
-        xr.setScreenParams(2.4f, 0.96f, 0f, 0f, 0f);
-        xr.createVideoSurface(Math.max(2, Math.round(width * scale) & ~1),
-                Math.max(2, Math.round(height * scale) & ~1));
-        xr.setAspectRatio(aspect);
+        xr.setScreenParams(2.4f, horizontalFov, 0f, 0f, 0f);
+        xr.createVideoSurface(renderWidth, renderHeight);
+        xr.setAspectRatio(VIEWPORT_ASPECT);
 
         texture = new SurfaceTexture(false);
         texture.setDefaultBufferSize(width, height);
@@ -156,15 +194,20 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         drawHud();
         xr.setHudVisible(true);
         xr.setVideoLayerEnabled(true);
+        // The request is applied by the XR thread after xrBeginSession.
+        xr.selectDisplayRefreshRate(90);
         xr.recenter();
         xr.start();
         routed = target.routePiliSurface(surface);
         if (!routed) throw new IllegalStateException("Flutter renderer unavailable");
+        BrowserPrimaryRate.acquire(activity, phoneScreen);
         startedAt = SystemClock.uptimeMillis();
-        Log.i(TAG, "Flutter routed to OpenXR at " + width + "x" + height);
+        Log.i(TAG, "Flutter 4:3 viewport " + width + "x" + height
+                + " routed to OpenXR " + renderWidth + "x" + renderHeight);
     }
 
     private void stopSession() {
+        BrowserPrimaryRate.release(activity);
         cancelTouch();
         input.reset();
         if (routed) {
@@ -190,6 +233,7 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         handler.removeCallbacks(this);
         holder.removeCallback(this);
         stopSession();
+        if (flutter.getLayoutParams() == headsetLayout) flutter.setLayoutParams(phoneLayout);
         ((ViewGroup) phoneScreen.getParent()).removeView(phoneScreen);
         hud.recycle();
     }
@@ -201,7 +245,8 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
             if (xr != null && (width != flutter.getWidth() || height != flutter.getHeight())) {
                 stopSession();
             }
-            if (xr == null && holder.getSurface().isValid() && flutter.getWidth() > 0 && flutter.getHeight() > 0) {
+            if (xr == null && holder.getSurface().isValid()
+                    && flutter.getWidth() == headsetLayout.width && flutter.getHeight() == headsetLayout.height) {
                 startSession();
             }
             if (xr != null) {
@@ -235,11 +280,25 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
             if (!input.tracked() || input.hit() != Cv10Input.SCREEN) {
                 cancelTouch();
             } else if (!input.selectDown()) {
+                if (dragging) {
+                    touchX = pointerX();
+                    touchY = pointerY();
+                }
                 sendTouch(MotionEvent.ACTION_UP);
                 touchDownTime = 0;
-            } else if (Math.abs(input.uv[0] * width - touchX) > 1f
-                    || Math.abs(input.uv[1] * height - touchY) > 1f) {
-                sendTouch(MotionEvent.ACTION_MOVE);
+            } else {
+                float x = pointerX();
+                float y = pointerY();
+                float dx = x - pressX;
+                float dy = y - pressY;
+                if (dragging || dx * dx + dy * dy > touchSlopSquared) {
+                    dragging = true;
+                    if (x != touchX || y != touchY) {
+                        touchX = x;
+                        touchY = y;
+                        sendTouch(MotionEvent.ACTION_MOVE);
+                    }
+                }
             }
             return;
         }
@@ -248,9 +307,16 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
             handleHud(input.uv[0] * HUD_WIDTH, input.uv[1] * HUD_HEIGHT);
         } else if (input.hit() == Cv10Input.SCREEN) {
             touchDownTime = SystemClock.uptimeMillis();
+            dragging = false;
+            pressX = touchX = pointerX();
+            pressY = touchY = pointerY();
             sendTouch(MotionEvent.ACTION_DOWN);
         }
     }
+
+    private float pointerX() { return Math.min(width - 1, input.uv[0] * width); }
+
+    private float pointerY() { return Math.min(height - 1, input.uv[1] * height); }
 
     private void cancelTouch() {
         if (touchDownTime == 0) return;
@@ -259,10 +325,6 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
     }
 
     private void sendTouch(int action) {
-        if (action != MotionEvent.ACTION_CANCEL) {
-            touchX = Math.min(width - 1, input.uv[0] * width);
-            touchY = Math.min(height - 1, input.uv[1] * height);
-        }
         MotionEvent event = MotionEvent.obtain(touchDownTime, SystemClock.uptimeMillis(),
                 action, touchX, touchY, 0);
         event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
@@ -312,15 +374,15 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
         Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         paint.setTextAlign(Paint.Align.CENTER);
         paint.setTextSize(32f);
-        drawRow(canvas, paint, TOOLBAR, 150, 76);
+        drawRow(canvas, paint, TOOLBAR, 0, TOOLBAR_HEIGHT);
         if (keyboard) {
             for (int i = 0; i < LETTERS.length; i++) {
                 String keys = upperCase ? LETTERS[i].toUpperCase(java.util.Locale.ROOT) : LETTERS[i];
                 String[] labels = new String[keys.length()];
                 for (int j = 0; j < keys.length(); j++) labels[j] = keys.substring(j, j + 1);
-                drawRow(canvas, paint, labels, 226 + 70 * i, 70);
+                drawRow(canvas, paint, labels, TOOLBAR_HEIGHT + KEY_ROW_HEIGHT * i, KEY_ROW_HEIGHT);
             }
-            drawRow(canvas, paint, EDIT_KEYS, 506, 76);
+            drawRow(canvas, paint, EDIT_KEYS, EDIT_ROW_TOP, TOOLBAR_HEIGHT);
         }
         xr.setHudBitmap(hud);
     }
@@ -342,7 +404,7 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
     }
 
     private void handleHud(float x, float y) {
-        if (y >= 150 && y < 226) {
+        if (y >= 0 && y < TOOLBAR_HEIGHT) {
             switch (keyIndex(x, TOOLBAR.length)) {
                 case 0: goBack(); break;
                 case 1: scrollPage(1); break;
@@ -353,12 +415,12 @@ public final class Cv10Browser implements Runnable, SurfaceHolder.Callback {
             }
             return;
         }
-        if (!keyboard || y < 226 || y >= 582) return;
+        if (!keyboard || y < TOOLBAR_HEIGHT || y >= EDIT_ROW_TOP + TOOLBAR_HEIGHT) return;
         EditorInfo editor = new EditorInfo();
         InputConnection connection = flutter.onCreateInputConnection(editor);
-        if (y < 506) {
+        if (y < EDIT_ROW_TOP) {
             if (connection == null) return;
-            String row = LETTERS[(int) ((y - 226) / 70)];
+            String row = LETTERS[(int) ((y - TOOLBAR_HEIGHT) / KEY_ROW_HEIGHT)];
             char key = row.charAt(keyIndex(x, row.length()));
             connection.commitText(String.valueOf(upperCase ? Character.toUpperCase(key) : key), 1);
         } else {

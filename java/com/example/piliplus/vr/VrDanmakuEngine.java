@@ -45,6 +45,9 @@ import java.util.zip.InflaterInputStream;
  */
 public final class VrDanmakuEngine {
     private static final String TAG = "PiliVR-Danmaku";
+    private static final int CINEMA_TEXT_WIDTH = 1600;
+    private static final int CINEMA_DANMAKU_HEIGHT = 264;
+    private static final int CINEMA_SUBTITLE_HEIGHT = 192;
 
     private static final int MAX_SCROLL_TRACKS = 32;
     private static final int MAX_TOP_TRACKS = 6;
@@ -387,7 +390,7 @@ public final class VrDanmakuEngine {
                 clearActiveTracks();
                 if (canvas != null && bitmap != null) {
                     canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
-                    if (bridge != null) bridge.setDanmakuBitmap(bitmap);
+                    if (bridge != null) uploadText(bridge, false, false);
                 }
                 wasCanvasEmpty = true;
             }
@@ -411,7 +414,7 @@ public final class VrDanmakuEngine {
                     canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
                     XrBridge bridge = this.xr;
                     if (bridge != null) {
-                        bridge.setDanmakuBitmap(bitmap);
+                        uploadText(bridge, false, false);
                     }
                 }
             }
@@ -453,12 +456,13 @@ public final class VrDanmakuEngine {
             if (!enabled) {
                 if (canvas != null && bitmap != null) {
                     canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
-                    if (danmakuEnabled && !activeList.isEmpty()) {
+                    boolean hasDanmaku = danmakuEnabled && !activeList.isEmpty();
+                    if (hasDanmaku) {
                         drawActiveDanmaku((float) Math.max(0.0, renderVideoSec));
                     }
                     XrBridge bridge = this.xr;
                     if (bridge != null) {
-                        bridge.setDanmakuBitmap(bitmap);
+                        uploadText(bridge, hasDanmaku, false);
                     }
                 }
             }
@@ -516,6 +520,7 @@ public final class VrDanmakuEngine {
     }
 
     public float getModeScaleRatio() {
+        if (usesCinemaTextPlanes()) return 1f;
         // Base reference is 720p eye video height in VR space.
         // effectiveEyeH / curSpanY represents the pixel height of 1x video height on the canvas.
         // Dividing by 720 gives the exact uniform scale ratio so font size and track spacing in VR
@@ -530,7 +535,7 @@ public final class VrDanmakuEngine {
         float base = getModeScaleRatio();
         // On portrait videos (aspect < 1.0), screen height spans a larger vertical FOV,
         // so scale danmaku down proportionally to keep VR angular glyph size balanced.
-        if (projectionMode == 0 && videoAspect < 0.99f) {
+        if (projectionMode == 0 && !usesCinemaTextPlanes() && videoAspect < 0.99f) {
             float factor = Math.max(0.50f, Math.min(1.0f, videoAspect));
             return base * factor;
         }
@@ -877,10 +882,35 @@ public final class VrDanmakuEngine {
 
     public void setProjectionMode(int mode) {
         synchronized (renderLock) {
+            if (this.projectionMode == mode) return;
             this.projectionMode = mode;
             updateCanvasAspect();
+            clearActiveTracks();
         }
     }
+
+    private boolean usesCinemaTextPlanes() {
+        return projectionMode == 0 && danmakuSpanIdx != 3;
+    }
+
+    private float scrollAreaHeight(float trackHeight) {
+        if (usesCinemaTextPlanes()) {
+            float fixedRows = fixedDanmakuEnabled ? 2 * trackHeight : 0f;
+            return Math.max(trackHeight, CINEMA_DANMAKU_HEIGHT - fixedRows - 28f);
+        }
+        return danmakuSpanIdx == 3 ? canvasH * 0.5f : canvasH;
+    }
+
+    private void uploadText(XrBridge bridge, boolean danmaku, boolean subtitle) {
+        if (usesCinemaTextPlanes()) {
+            submitCinemaText(bridge.getNativeHandle(), bitmap, CINEMA_DANMAKU_HEIGHT, danmaku, subtitle);
+        } else {
+            bridge.setDanmakuBitmap(bitmap);
+        }
+    }
+
+    private static native void submitCinemaText(long session, Bitmap bitmap, int danmakuHeight,
+            boolean danmaku, boolean subtitle);
 
     private void updateCanvasAspect() {
         int vw = 1920;
@@ -919,7 +949,10 @@ public final class VrDanmakuEngine {
 
         float desiredAspect = aspect * (spanX / spanY);
         int targetW, targetH;
-        if (danmakuSpanIdx == 3) {
+        if (usesCinemaTextPlanes()) {
+            targetW = CINEMA_TEXT_WIDTH;
+            targetH = CINEMA_DANMAKU_HEIGHT + CINEMA_SUBTITLE_HEIGHT;
+        } else if (danmakuSpanIdx == 3) {
             // Stereo mode (2D video only): over-under layout (targetH = 2 * eyeH).
             // Use 720p per eye on portrait videos (still well below 2304px width) to keep scaled-down
             // glyphs crisp while staying within the 2400x1440 OpenXR swapchain.
@@ -1112,7 +1145,7 @@ public final class VrDanmakuEngine {
                 if (!wasCanvasEmpty && canvas != null && bitmap != null) {
                     canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
                     AiDepthNative.setDanmakuUploadHeight(canvasH);
-                    bridge.setDanmakuBitmap(bitmap);
+                    uploadText(bridge, false, false);
                     wasCanvasEmpty = true;
                     resetLastDrawnState();
                 }
@@ -1123,7 +1156,8 @@ public final class VrDanmakuEngine {
             boolean sameCc = (lastDrawnCcText == null) ? (ccText == null) : lastDrawnCcText.equals(ccText);
             if (!wasCanvasEmpty
                     && !Float.isNaN(lastDrawnSec)
-                    && Math.abs(curSec - lastDrawnSec) < 0.0001f
+                    && ((!hasDanmaku && usesCinemaTextPlanes())
+                            || Math.abs(curSec - lastDrawnSec) < 0.0001f)
                     && activeList.size() == lastDrawnActiveCount
                     && sameCc
                     && appliedScaleGeneration == lastDrawnScaleGen
@@ -1174,7 +1208,7 @@ public final class VrDanmakuEngine {
                 }
                 if (uploadH > canvasH) uploadH = canvasH;
                 AiDepthNative.setDanmakuUploadHeight(uploadH);
-                bridge.setDanmakuBitmap(bitmap);
+                uploadText(bridge, hasDanmaku, hasCc);
                 wasCanvasEmpty = false;
                 lastDrawnSec = curSec;
                 lastDrawnActiveCount = activeList.size();
@@ -1379,8 +1413,10 @@ public final class VrDanmakuEngine {
 
         float scaleRatio = getDanmakuScaleRatio();
         float trackH = 40f * danmakuScale * scaleRatio;
-        float areaH = (danmakuSpanIdx == 3) ? (canvasH * 0.5f) : canvasH;
-        int estTracks = Math.min(MAX_SCROLL_TRACKS, Math.max(2, (int) ((areaH * DENSITY_HEIGHT_FRAC[dIdx]) / trackH)));
+        float areaH = scrollAreaHeight(trackH);
+        int minTracks = usesCinemaTextPlanes() ? 1 : 2;
+        int estTracks = Math.min(MAX_SCROLL_TRACKS,
+                Math.max(minTracks, (int) ((areaH * DENSITY_HEIGHT_FRAC[dIdx]) / trackH)));
         float minLaunchIntervalSec = (danmakuSpanIdx == 3)
                 ? 0.075f
                 : Math.max(0.014f, 0.25f / Math.max(2, estTracks));
@@ -1431,6 +1467,7 @@ public final class VrDanmakuEngine {
         ensureSprite(ad);
         float w = ad.width;
         int maxPinTracks = Math.min(MAX_TOP_TRACKS, DENSITY_PIN_TRACKS[dIdx]);
+        if (usesCinemaTextPlanes()) maxPinTracks = 1;
 
         if (item.mode == 5) {
             for (int t = 0; t < maxPinTracks; t++) {
@@ -1504,9 +1541,10 @@ public final class VrDanmakuEngine {
             float duration = (canvasW + w) / speed;
             float heightFrac = DENSITY_HEIGHT_FRAC[dIdx];
             float minGap = DENSITY_MIN_GAP[dIdx] * scaleRatio;
-            float videoH = canvasH;
             float trackH = 40f * danmakuScale * scaleRatio;
-            int maxTracks = Math.min(MAX_SCROLL_TRACKS, Math.max(2, (int) ((videoH * heightFrac) / trackH)));
+            float videoH = scrollAreaHeight(trackH);
+            int minTracks = usesCinemaTextPlanes() ? 1 : 2;
+            int maxTracks = Math.min(MAX_SCROLL_TRACKS, Math.max(minTracks, (int) ((videoH * heightFrac) / trackH)));
             for (int t = 0; t < maxTracks; t++) {
                 ActiveDanmaku prev = scrollTracks[t];
                 if (prev == null || curSec >= prev.endSec) {
@@ -1545,12 +1583,16 @@ public final class VrDanmakuEngine {
 
         if (danmakuSpanIdx != 3) {
             // Normal mono rendering (modes 0, 1, 2)
-            float videoTop = (spanY > 1.01f) ? (canvasH * (0.5f - 0.5f / spanY)) : 0f;
-            float videoBottom = (spanY > 1.01f) ? (canvasH * (0.5f + 0.5f / spanY)) : canvasH;
+            boolean floating = usesCinemaTextPlanes();
+            float bandHeight = floating ? CINEMA_DANMAKU_HEIGHT : canvasH;
+            float videoTop = (!floating && spanY > 1.01f) ? (canvasH * (0.5f - 0.5f / spanY)) : 0f;
+            float videoBottom = (!floating && spanY > 1.01f) ? (canvasH * (0.5f + 0.5f / spanY)) : bandHeight;
+            float scrollTop = topPadding + (floating && fixedDanmakuEnabled ? trackHeight : 0f);
+            float bottomPadding = floating ? topPadding : Math.max(110f * scaleRatio, 100f * modeScaleRatio);
             float fadeDist = Math.max(90f * scaleRatio, canvasW * 0.08f);
 
             canvas.save();
-            canvas.clipRect(2f, 0f, canvasW - 2f, canvasH);
+            canvas.clipRect(2f, 0f, canvasW - 2f, bandHeight);
             for (int i = 0; i < activeList.size(); i++) {
                 ActiveDanmaku ad = activeList.get(i);
                 if (ad.sprite == null || ad.sprite.isRecycled()) {
@@ -1569,7 +1611,7 @@ public final class VrDanmakuEngine {
                     if (remain < 0.35f) alphaFactor = Math.min(alphaFactor, Math.max(0.0f, remain / 0.35f));
                 } else if (ad.item.mode == 4) {
                     x = (canvasW - ad.width) * 0.5f;
-                    y = videoBottom - Math.max(110f * scaleRatio, 100f * modeScaleRatio) - (ad.track + 1) * trackHeight;
+                    y = videoBottom - bottomPadding - (ad.track + 1) * trackHeight;
                     float elapsed = curSec - ad.startSec;
                     float remain = ad.endSec - curSec;
                     if (elapsed < 0.35f) alphaFactor = Math.min(alphaFactor, Math.max(0.0f, elapsed / 0.35f));
@@ -1577,7 +1619,7 @@ public final class VrDanmakuEngine {
                 } else {
                     float elapsed = curSec - ad.startSec;
                     x = canvasW - elapsed * ad.speedPxPerSec;
-                    y = topPadding + ad.track * trackHeight;
+                    y = scrollTop + ad.track * trackHeight;
                     if (x > canvasW - fadeDist) {
                         alphaFactor = Math.min(alphaFactor, Math.max(0.0f, (canvasW - x) / fadeDist));
                     }
@@ -1955,30 +1997,41 @@ public final class VrDanmakuEngine {
 
     private void drawCcSubtitle(String text) {
         String[] lines = text.split("\n");
+        if (lines.length == 0) return;
+        boolean floating = usesCinemaTextPlanes();
         float scaleRatio = getModeScaleRatio();
         float fontSize = 34f * subtitleScale * scaleRatio;
+        if (floating) {
+            fontSize = Math.min(fontSize, (CINEMA_SUBTITLE_HEIGHT - 24f) / (lines.length * 1.28f));
+        }
         subTextPaint.setTextSize(fontSize);
-        subStrokePaint.setTextSize(fontSize);
-        subStrokePaint.setStrokeWidth(Math.max(1.5f, fontSize * 0.095f));
 
-        float lineHeight = fontSize * 1.28f;
         float maxW = 0f;
         for (String line : lines) {
             float w = subTextPaint.measureText(line.trim());
             if (w > maxW) maxW = w;
         }
         if (maxW <= 0f) return;
+        if (floating && maxW > canvasW - 100f) {
+            fontSize *= (canvasW - 100f) / maxW;
+            subTextPaint.setTextSize(fontSize);
+            maxW = canvasW - 100f;
+        }
+        subStrokePaint.setTextSize(fontSize);
+        subStrokePaint.setStrokeWidth(Math.max(1.5f, fontSize * 0.095f));
+        float lineHeight = fontSize * 1.28f;
 
         int eyeCount = (danmakuSpanIdx == 3) ? 2 : 1;
         int eyeH = (danmakuSpanIdx == 3) ? (canvasH / 2) : canvasH;
 
         float totalH = lines.length * lineHeight + 18f * scaleRatio;
         float padH = 26f * scaleRatio;
-        float visibleVideoW = (spanX > 1.01f) ? (canvasW / spanX) : canvasW;
+        float visibleVideoW = (!floating && spanX > 1.01f) ? (canvasW / spanX) : canvasW;
         float boxW = Math.min(visibleVideoW - 48f * scaleRatio, maxW + padH * 2f);
         float cx = canvasW * 0.5f;
         float videoBottom = (spanY > 1.01f) ? (eyeH * (0.5f + 0.5f / spanY)) : eyeH;
-        float baseBottomY = videoBottom - Math.max(16f * scaleRatio, (eyeH / spanY) * 0.035f);
+        float baseBottomY = floating ? CINEMA_DANMAKU_HEIGHT + (CINEMA_SUBTITLE_HEIGHT + totalH) / 2f
+                : videoBottom - Math.max(16f * scaleRatio, (eyeH / spanY) * 0.035f);
         float baseTopY = baseBottomY - totalH;
 
         for (int eye = 0; eye < eyeCount; eye++) {

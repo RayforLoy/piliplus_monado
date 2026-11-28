@@ -14,16 +14,15 @@ import android.widget.Toast;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.zip.CRC32;
 
 public final class VrState {
+    static final float CONTROLLER_TAP_SLOP_DP = 14.0f;
     private static final String TAG = "PiliVR";
 
     public static volatile boolean vrActive = false;
@@ -126,142 +125,6 @@ public final class VrState {
     private VrState() {}
 
     /**
-     * Ensures PiliPlus's Hive setting box has `horizontalScreen = true` and
-     * `defaultShowComment = true` so that in 16:9 landscape windows, the video detail
-     * page uses the split landscape layout (video + intro on the left, comments on the right)
-     * instead of stretching the video to 100% height and hiding the comments section.
-     */
-    public static void ensureLandscapeSettings(Activity activity) {
-        if (activity == null) return;
-        try {
-            SharedPreferences sp = activity.getSharedPreferences("pili_vr_prefs", Context.MODE_PRIVATE);
-            if (sp.getBoolean("vr_landscape_hive_v2", false)) {
-                return;
-            }
-            File[] candidates = new File[]{
-                new File(activity.getFilesDir(), "hive/setting.hive"),
-                new File(activity.getApplicationInfo().dataDir, "app_flutter/hive/setting.hive")
-            };
-            boolean updatedAny = false;
-            for (File f : candidates) {
-                if (f.exists() && f.isFile() && f.length() >= 8) {
-                    if (patchSettingHiveFile(f)) {
-                        updatedAny = true;
-                    }
-                }
-            }
-            if (updatedAny) {
-                sp.edit().putBoolean("vr_landscape_hive_v2", true).apply();
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "ensureLandscapeSettings failed", t);
-        }
-    }
-
-    private static boolean patchSettingHiveFile(File hiveFile) {
-        try {
-            byte[] data = readFileBytes(hiveFile);
-            if (data == null || data.length < 8) return false;
-
-            int pos = 0;
-            Boolean crcIncludesLen = null;
-            int boolValType = 3; // Hive FrameValueType.boolT = 3
-            boolean foundHoriz = false;
-            boolean foundComment = false;
-            boolean modified = false;
-
-            while (pos + 8 <= data.length) {
-                int len = readLeInt(data, pos);
-                if (len < 8 || pos + len > data.length) {
-                    Log.w(TAG, "setting.hive frame length mismatch at pos=" + pos + " len=" + len + " total=" + data.length);
-                    return false;
-                }
-                long storedCrc = readLeUint32(data, pos + len - 4);
-                long crcFull = computeCrc32(data, pos, len - 4);
-                long crcBody = computeCrc32(data, pos + 4, len - 8);
-                if (crcIncludesLen == null) {
-                    if (crcFull == storedCrc) {
-                        crcIncludesLen = Boolean.TRUE;
-                    } else if (crcBody == storedCrc) {
-                        crcIncludesLen = Boolean.FALSE;
-                    } else {
-                        Log.w(TAG, "setting.hive CRC mismatch at pos=" + pos);
-                        return false;
-                    }
-                }
-                int keyType = data[pos + 4] & 0xFF;
-                if (keyType == 1 && pos + 6 <= pos + len - 4) {
-                    int keyLen = data[pos + 5] & 0xFF;
-                    int valOffset = pos + 6 + keyLen;
-                    if (valOffset <= pos + len - 4) {
-                        String key = new String(data, pos + 6, keyLen, StandardCharsets.UTF_8);
-                        if (valOffset + 2 == pos + len - 4) {
-                            int vt = data[valOffset] & 0xFF;
-                            int bv = data[valOffset + 1] & 0xFF;
-                            if (bv == 0 || bv == 1) {
-                                boolValType = vt;
-                            }
-                            if ("horizontalScreen".equals(key)) {
-                                foundHoriz = true;
-                                if (bv != 1) {
-                                    data[valOffset + 1] = 1;
-                                    long newCrc = crcIncludesLen
-                                            ? computeCrc32(data, pos, len - 4)
-                                            : computeCrc32(data, pos + 4, len - 8);
-                                    writeLeInt(data, pos + len - 4, (int) newCrc);
-                                    modified = true;
-                                }
-                            } else if ("defaultShowComment".equals(key)) {
-                                foundComment = true;
-                                if (bv != 1) {
-                                    data[valOffset + 1] = 1;
-                                    long newCrc = crcIncludesLen
-                                            ? computeCrc32(data, pos, len - 4)
-                                            : computeCrc32(data, pos + 4, len - 8);
-                                    writeLeInt(data, pos + len - 4, (int) newCrc);
-                                    modified = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                pos += len;
-            }
-
-            if (pos != data.length) {
-                return false;
-            }
-            boolean incLen = (crcIncludesLen == null) ? true : crcIncludesLen.booleanValue();
-            ByteArrayOutputStream out = new ByteArrayOutputStream(data.length + 64);
-            out.write(data);
-            if (!foundHoriz) {
-                out.write(buildHiveBoolFrame("horizontalScreen", boolValType, true, incLen));
-                modified = true;
-            }
-            if (!foundComment) {
-                out.write(buildHiveBoolFrame("defaultShowComment", boolValType, true, incLen));
-                modified = true;
-            }
-            if (modified) {
-                FileOutputStream fos = new FileOutputStream(hiveFile, false);
-                try {
-                    fos.write(out.toByteArray());
-                    fos.getFD().sync();
-                } finally {
-                    fos.close();
-                }
-                Log.i(TAG, "Patched " + hiveFile.getAbsolutePath() + " (horizontalScreen=true, defaultShowComment=true)");
-            } else {
-                Log.i(TAG, "Verified " + hiveFile.getAbsolutePath() + " already has horizontalScreen=true, defaultShowComment=true");
-            }
-            return true;
-        } catch (Throwable t) {
-            Log.w(TAG, "patchSettingHiveFile failed", t);
-            return false;
-        }
-    }
-
-    /**
      * Reads the latest boolean value for a key from PiliPlus's setting.hive box.
      * Returns null if the key is not present or cannot be read.
      */
@@ -307,22 +170,6 @@ public final class VrState {
         return null;
     }
 
-    private static byte[] buildHiveBoolFrame(String key, int valType, boolean val, boolean crcIncludesLen) {
-        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-        int len = 4 + 1 + 1 + keyBytes.length + 1 + 1 + 4;
-        byte[] frame = new byte[len];
-        writeLeInt(frame, 0, len);
-        frame[4] = 1; // ASCII key
-        frame[5] = (byte) keyBytes.length;
-        System.arraycopy(keyBytes, 0, frame, 6, keyBytes.length);
-        int vo = 6 + keyBytes.length;
-        frame[vo] = (byte) valType;
-        frame[vo + 1] = (byte) (val ? 1 : 0);
-        long crc = crcIncludesLen ? computeCrc32(frame, 0, len - 4) : computeCrc32(frame, 4, len - 8);
-        writeLeInt(frame, len - 4, (int) crc);
-        return frame;
-    }
-
     private static byte[] readFileBytes(File f) throws Exception {
         FileInputStream fis = new FileInputStream(f);
         try {
@@ -343,23 +190,6 @@ public final class VrState {
                 | ((b[off + 1] & 0xFF) << 8)
                 | ((b[off + 2] & 0xFF) << 16)
                 | ((b[off + 3] & 0xFF) << 24);
-    }
-
-    private static long readLeUint32(byte[] b, int off) {
-        return ((long) readLeInt(b, off)) & 0xFFFFFFFFL;
-    }
-
-    private static void writeLeInt(byte[] b, int off, int v) {
-        b[off] = (byte) (v & 0xFF);
-        b[off + 1] = (byte) ((v >>> 8) & 0xFF);
-        b[off + 2] = (byte) ((v >>> 16) & 0xFF);
-        b[off + 3] = (byte) ((v >>> 24) & 0xFF);
-    }
-
-    private static long computeCrc32(byte[] b, int off, int len) {
-        CRC32 crc = new CRC32();
-        crc.update(b, off, len);
-        return crc.getValue();
     }
 
     /**
@@ -383,7 +213,7 @@ public final class VrState {
                         density = activity.getResources().getDisplayMetrics().density;
                         if (density <= 0f) density = 1.0f;
                     }
-                    float slop = 14.0f * density;
+                    float slop = CONTROLLER_TAP_SLOP_DP * density;
                     float dx = ev.getX() - touchDownX;
                     float dy = ev.getY() - touchDownY;
                     if (dx * dx + dy * dy < slop * slop) {

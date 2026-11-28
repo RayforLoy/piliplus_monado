@@ -54,6 +54,11 @@ def build_vr_classes(app, work, sdk, build_tools, apktool):
 
 
 def build(output, work, sdk):
+    shared_keystore = os.getenv("CV10_ANDROID_KEYSTORE")
+    key = Path(shared_keystore).resolve() if shared_keystore else Path.home() / ".android/debug.keystore"
+    if not key.is_file():
+        raise FileNotFoundError(f"Signing keystore not found: {key}")
+    password_args = [] if shared_keystore else ["--ks-pass", "pass:android"]
     prefab = HERE / "deps/openxr_aar/prefab/modules"
     app = work / "apktool"
     shutil.copytree(HERE / "apktool", app)
@@ -72,8 +77,7 @@ def build(output, work, sdk):
     run("java", "-jar", jar, "if", "-p", frameworks, HERE / "tools/framework/1.apk")
     run("java", "-jar", jar, "b", "-p", frameworks, app, "-o", work / "unsigned.apk")
     run(bt / "zipalign.exe", "-P", "16", "4", work / "unsigned.apk", work / "aligned.apk")
-    key = Path.home() / ".android/debug.keystore"
-    run(bt / "apksigner.bat", "sign", "--ks", key, "--ks-pass", "pass:android",
+    run(bt / "apksigner.bat", "sign", "--ks", key, *password_args,
         "--ks-key-alias", "androiddebugkey", "--v4-signing-enabled", "false",
         "--out", work / "signed.apk", work / "aligned.apk")
     run(bt / "apksigner.bat", "verify", "--verbose", work / "signed.apk")

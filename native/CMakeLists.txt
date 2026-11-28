@@ -13,6 +13,7 @@ set_target_properties(openxr_loader PROPERTIES
 )
 
 add_library(p5m-vr SHARED
+        controller_model.cpp
         pilha_nativa.cpp
         p5m_jni.cpp
         spatializer.cpp
